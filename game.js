@@ -380,12 +380,19 @@ const endContainer = document.getElementById("endScreen") || document.createElem
 endContainer.id = "endScreen";
 endContainer.style.display = "none";
 endContainer.innerHTML = `
-    <div class="end-panel">
-        <h1 id="endTitle"></h1>
-        <p id="endMode">Mode: ---</p>
-        <p id="endScore">Score: 0</p>
-        <input type="text" id="playerName" placeholder="ENTER NAME TAG" maxlength="12" autocomplete="off" />
-        <button id="btnSubmitScore">SUBMIT SCORE</button>
+    <div class="end-panel result-panel">
+        <span id="endResultBadge" class="result-badge">RESULT</span>
+        <h1 id="endTitle">RESULT</h1>
+        <p id="endSubtext" class="result-subtext">Run complete.</p>
+        <div class="result-stats">
+            <p id="endMode">Mode: ---</p>
+            <p id="endScore">Final Score: 0</p>
+        </div>
+        <div class="result-actions">
+            <button id="btnSubmitScore" type="button">SAVE SCORE</button>
+            <button id="btnEndBackMenu" type="button">BACK TO MENU</button>
+        </div>
+        <p id="endSaveStatus" class="end-save-status">Save your score or return to menu.</p>
     </div>
 `;
 if (!endContainer.parentElement) document.body.appendChild(endContainer);
@@ -410,6 +417,7 @@ const defaultLeaderboards = {
 let currentMode = "arcade";
 let gameplaySessionId = 0;
 let scoreSubmissionLocked = false;
+let endScreenShown = false;
 let localLeaderboard = loadLocalLeaderboards();
 
 function normalizeLeaderboardData(data) {
@@ -561,22 +569,101 @@ async function updateLeaderboardUI() {
     }
 }
 
+// Dev-only local test: run seedTestLeaderboardScores("arcade", 35) in the browser console.
+// It proves 20-30+ entries won't break the leaderboard because it still displays only the top 10.
+window.seedTestLeaderboardScores = async function(mode = "arcade", count = 35) {
+    const safeMode = mode === "boss" ? "boss" : "arcade";
+    if (!localLeaderboard[safeMode]) localLeaderboard[safeMode] = [];
+    for (let i = 0; i < count; i++) {
+        localLeaderboard[safeMode].push({
+            name: `TEST${String(i + 1).padStart(2, "0")}`,
+            score: Math.floor(Math.random() * 250000)
+        });
+    }
+    sortAndTrimLeaderboard(safeMode);
+    saveLocalLeaderboards();
+    await updateLeaderboardUI();
+    console.log(`${safeMode.toUpperCase()} leaderboard tested with ${count} fake local scores. Showing top 10 only.`);
+};
+
+function getLoggedInScoreName() {
+    const displayName = firebaseUser?.displayName || "";
+    const emailName = firebaseUser?.email ? firebaseUser.email.split("@")[0] : "";
+    const fallbackName = authNameInput?.value || "";
+    return cleanLeaderboardName(displayName || fallbackName || emailName || "SLAYER");
+}
+
+function getResultScoreName() {
+    // Save using the logged-in account internally, but never display the nametag in the result box.
+    if (firebaseReady && firebaseUser) return getLoggedInScoreName();
+
+    const fallbackName = authNameInput?.value || "";
+    return cleanLeaderboardName(fallbackName || "SLAYER");
+}
+
+function prefillResultName() {
+    // Privacy fix: result screen never shows the player nametag.
+    const nameInput = document.getElementById("playerName");
+    if (nameInput) nameInput.style.display = "none";
+
+    const lockedNameLabel = document.getElementById("lockedPlayerName");
+    if (lockedNameLabel) lockedNameLabel.remove();
+}
+
+async function returnToMenuAfterRun() {
+    stopBreathingSoundAfterCurrentFile();
+    stopBattleMusic();
+    stopBossMusic();
+    gameplaySessionId++;
+    resetInputState();
+    resetRunVisualAndCutsceneState();
+    pausePausedAudios = [];
+    gameOver = false;
+    gameWon = false;
+    endSequenceTimer = 0;
+    endScreenShown = false;
+    scoreSubmissionLocked = false;
+    gameState = "menu";
+
+    const endScreen = document.getElementById("endScreen");
+    if (endScreen) endScreen.style.display = "none";
+
+    menuContainer.style.display = "flex";
+    menuContainer.classList.remove("menu-launching");
+    requestAnimationFrame(() => menuContainer.classList.add("menu-active"));
+    await updateLeaderboardUI();
+
+    if (bgmMenuTheme) {
+        bgmMenuTheme.currentTime = 0;
+        startMenuMusic();
+    }
+}
+
 const submitScoreButton = document.getElementById("btnSubmitScore");
 if (submitScoreButton) {
     submitScoreButton.onclick = async () => {
         if (scoreSubmissionLocked) return;
         scoreSubmissionLocked = true;
+        submitScoreButton.disabled = true;
         submitScoreButton.textContent = "SAVING...";
 
-        const nameInput = document.getElementById("playerName");
-        const name = nameInput ? nameInput.value : "SLAYER";
+        const status = document.getElementById("endSaveStatus");
+        if (status) status.textContent = "Saving score...";
+
+        const name = getResultScoreName();
 
         await submitLeaderboardScore(currentMode, name, score);
         await updateLeaderboardUI();
 
         submitScoreButton.textContent = "SAVED!";
-        setTimeout(() => location.reload(), 650);
+        if (status) status.textContent = "Score saved. Returning to menu...";
+        setTimeout(() => returnToMenuAfterRun(), 700);
     };
+}
+
+const btnEndBackMenu = document.getElementById("btnEndBackMenu");
+if (btnEndBackMenu) {
+    btnEndBackMenu.onclick = () => returnToMenuAfterRun();
 }
 
 
@@ -777,13 +864,14 @@ function resumeGameFromPause() {
 }
 
 function getNameForPauseSave() {
+    // Save internally without asking/displaying the player's nametag.
     const firebaseName = firebaseUser?.displayName || firebaseUser?.email;
     if (firebaseName) return firebaseName;
 
-    const typedName = authNameInput?.value || document.getElementById("playerName")?.value;
+    const typedName = authNameInput?.value || "";
     if (typedName && typedName.trim()) return typedName;
 
-    return prompt("SAVE SCORE AS:", "SLAYER") || "SLAYER";
+    return "SLAYER";
 }
 
 async function leaveCurrentRun(saveScore) {
@@ -813,6 +901,7 @@ async function leaveCurrentRun(saveScore) {
     gameOver = false;
     gameWon = false;
     endSequenceTimer = 0;
+    endScreenShown = false;
     gameState = "menu";
 
     const endScreen = document.getElementById("endScreen");
@@ -905,7 +994,13 @@ function startGameplay(mode) {
     }, 520);
     
     score = 0; combo = 0; spawnTimer = 0; endSequenceTimer = 0; damageFlashTimer = 0;
-    gameOver = false; gameWon = false;
+    gameOver = false; gameWon = false; endScreenShown = false; scoreSubmissionLocked = false;
+    const endScreen = document.getElementById("endScreen");
+    if (endScreen) endScreen.style.display = "none";
+    const submitButton = document.getElementById("btnSubmitScore");
+    if (submitButton) { submitButton.disabled = false; submitButton.textContent = "SAVE SCORE"; }
+    const saveStatus = document.getElementById("endSaveStatus");
+    if (saveStatus) saveStatus.textContent = "Save your score or return to menu.";
     
     player.maxHealth = BOSS_TEST_MODE ? 485 : 100;
     player.health = player.maxHealth;
@@ -1848,6 +1943,36 @@ function drawAkazaSmoke() { if (!akazaIntro.active && akazaIntro.smoke.length <=
 function drawAkazaShockRings() { if (!akazaIntro.active) return; akazaIntro.shockRings.forEach((r) => { ctx.save(); ctx.globalAlpha = r.alpha; ctx.strokeStyle = "#f8fafc"; ctx.lineWidth = 6; ctx.beginPath(); ctx.ellipse(r.x - cameraX, r.y, r.radius * 1.45, r.radius * 0.25, 0, 0, Math.PI * 2); ctx.stroke(); ctx.strokeStyle = "#38bdf8"; ctx.lineWidth = 2; ctx.beginPath(); ctx.ellipse(r.x - cameraX, r.y, r.radius * 1.15, r.radius * 0.16, 0, 0, Math.PI * 2); ctx.stroke(); ctx.restore(); }); }
 function drawAkazaLetterbox() { if (!akazaIntro.active && akazaIntro.letterbox <= 0) return; ctx.save(); const h = akazaIntro.letterbox; ctx.fillStyle = "#000000"; ctx.fillRect(0, 0, canvas.width, h); ctx.fillRect(0, canvas.height - h, canvas.width, h); if (akazaIntro.dialogue) { ctx.textAlign = "center"; ctx.font = `bold 28px ${PIXEL_FONT}`; ctx.strokeStyle = "#000000"; ctx.lineWidth = 5; const dY = canvas.height - h / 2 + 10; ctx.strokeText(akazaIntro.dialogue, canvas.width / 2, dY); ctx.fillStyle = akazaIntro.dialogue.startsWith("akaza") ? "#f472b6" : "#38bdf8"; ctx.fillText(akazaIntro.dialogue, canvas.width / 2, dY); ctx.textAlign = "start"; } ctx.restore(); }
 
+function showResultScreen() {
+    if (endScreenShown) return;
+    endScreenShown = true;
+
+    const endScreen = document.getElementById("endScreen");
+    const endTitle = document.getElementById("endTitle");
+    const endSubtext = document.getElementById("endSubtext");
+    const endBadge = document.getElementById("endResultBadge");
+    const endMode = document.getElementById("endMode");
+    const endScore = document.getElementById("endScore");
+    const submitButton = document.getElementById("btnSubmitScore");
+    const status = document.getElementById("endSaveStatus");
+
+    if (!endScreen || !endTitle || !endScore) return;
+
+    endScreen.style.display = "flex";
+    endTitle.innerText = gameWon ? "VICTORY" : "DEFEAT";
+    endTitle.className = gameWon ? "victory" : "defeat";
+    if (endSubtext) endSubtext.innerText = gameWon ? "Akaza defeated. Run complete." : "You fell in battle. Save your score?";
+    if (endBadge) {
+        endBadge.innerText = gameWon ? "BOSS CLEARED" : "RUN ENDED";
+        endBadge.className = gameWon ? "result-badge victory" : "result-badge defeat";
+    }
+    if (endMode) endMode.innerText = `Mode: ${currentMode.toUpperCase()}`;
+    endScore.innerText = `Final Score: ${score.toLocaleString()}`;
+    if (submitButton) { submitButton.disabled = false; submitButton.textContent = "SAVE SCORE"; }
+    if (status) status.textContent = "Save your score or return to menu.";
+    prefillResultName();
+}
+
 // =====================================================
 // UPDATE PIPELINE
 // =====================================================
@@ -1864,18 +1989,7 @@ function update() {
             stopBossMusic();
         }
         endSequenceTimer += realDt;
-        if (endSequenceTimer > 180) {
-            const endScreen = document.getElementById("endScreen");
-            const endTitle = document.getElementById("endTitle");
-            const endMode = document.getElementById("endMode");
-            const endScore = document.getElementById("endScore");
-
-            endScreen.style.display = "flex";
-            endTitle.innerText = gameWon ? "UPPER MOON SLAIN" : "DIED IN BATTLE";
-            endTitle.className = gameWon ? "victory" : "defeat";
-            if (endMode) endMode.innerText = `Mode: ${currentMode.toUpperCase()}`;
-            endScore.innerText = `Final Score: ${score.toLocaleString()}`;
-        }
+        if (endSequenceTimer > 180) showResultScreen();
         return; 
     }
 
@@ -2296,46 +2410,206 @@ function drawHealTexts() { healTexts.forEach((h) => { ctx.save(); ctx.globalAlph
 // CLEAN HUD
 // =====================================================
 function drawHUD() { drawScoreText(); drawTopBars(); drawFormsMinimal(); }
-function drawScoreText() { ctx.save(); ctx.fillStyle = "#ffffff"; ctx.strokeStyle = "#000000"; ctx.lineWidth = 4; ctx.font = `bold 28px ${PIXEL_FONT}`; ctx.strokeText(`SCORE: ${score}`, 24, 42); ctx.fillText(`SCORE: ${score}`, 24, 42); ctx.restore(); }
+function getHudScale() { return clamp(Math.min(canvas.width / 1600, canvas.height / 850), 0.56, 1); }
+function px(n) { return Math.max(8, Math.round(n * getHudScale())); }
+
+function drawScoreText() {
+    const s = getHudScale();
+    ctx.save();
+    ctx.fillStyle = "#ffffff";
+    ctx.strokeStyle = "#000000";
+    ctx.lineWidth = Math.max(2, 4 * s);
+    ctx.font = `bold ${Math.round(28 * s)}px ${PIXEL_FONT}`;
+    ctx.strokeText(`SCORE: ${score.toLocaleString()}`, 24 * s, 42 * s);
+    ctx.fillText(`SCORE: ${score.toLocaleString()}`, 24 * s, 42 * s);
+    ctx.restore();
+}
 
 function drawTopBars() {
-    const barW = 520; const barH = 24; const x = canvas.width / 2 - barW / 2; const hpY = 90; const breathY = 126;
-    ctx.save(); ctx.fillStyle = "#ffffff"; ctx.strokeStyle = "#000000"; ctx.lineWidth = 3; ctx.font = `bold 20px ${PIXEL_FONT}`; ctx.strokeText("HP", x, hpY - 8); ctx.fillText("HP", x, hpY - 8);
-    ctx.fillStyle = "rgba(0,0,0,0.45)"; ctx.fillRect(x, hpY, barW, barH);
-    
-    const hpPct = clamp(player.health / player.maxHealth, 0, 1); ctx.fillStyle = player.health > player.maxHealth * 0.5 ? "#22c55e" : player.health > player.maxHealth * 0.25 ? "#f59e0b" : "#ef4444"; ctx.fillRect(x, hpY, barW * hpPct, barH);
-    ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 3; ctx.strokeRect(x, hpY, barW, barH);
-    ctx.font = `bold 18px ${PIXEL_FONT}`; ctx.strokeStyle = "#000000"; ctx.lineWidth = 3; ctx.strokeText(`${Math.ceil(player.health)} / ${player.maxHealth}`, x + barW / 2 - 55, hpY + 18); ctx.fillStyle = "#ffffff"; ctx.fillText(`${Math.ceil(player.health)} / ${player.maxHealth}`, x + barW / 2 - 55, hpY + 18);
-    
-    ctx.strokeStyle = "#000000"; ctx.lineWidth = 3; ctx.font = `bold 20px ${PIXEL_FONT}`; ctx.strokeText("BREATH", x, breathY - 8); ctx.fillStyle = "#ffffff"; ctx.fillText("BREATH", x, breathY - 8);
-    ctx.fillStyle = "rgba(0,0,0,0.45)"; ctx.fillRect(x, breathY, barW, barH);
-    const breathPct = clamp(player.breathing / player.maxBreathing, 0, 1); ctx.fillStyle = "#06b6d4"; ctx.fillRect(x, breathY, barW * breathPct, barH);
-    ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 3; ctx.strokeRect(x, breathY, barW, barH);
-    ctx.font = `bold 18px ${PIXEL_FONT}`; ctx.strokeStyle = "#000000"; ctx.lineWidth = 3; ctx.strokeText(`${Math.floor(player.breathing)} / ${player.maxBreathing}`, x + barW / 2 - 70, breathY + 18); ctx.fillStyle = "#ffffff"; ctx.fillText(`${Math.floor(player.breathing)} / ${player.maxBreathing}`, x + barW / 2 - 70, breathY + 18);
+    const s = getHudScale();
+    const barW = Math.min(520 * s, canvas.width * 0.46);
+    const barH = Math.max(15, 24 * s);
+    const x = canvas.width / 2 - barW / 2;
+    const hpY = 90 * s;
+    const breathY = hpY + 36 * s;
+    const labelFont = Math.max(12, 20 * s);
+    const valueFont = Math.max(11, 18 * s);
+
+    ctx.save();
+    ctx.fillStyle = "#ffffff";
+    ctx.strokeStyle = "#000000";
+    ctx.lineWidth = Math.max(2, 3 * s);
+    ctx.font = `bold ${labelFont}px ${PIXEL_FONT}`;
+    ctx.strokeText("HP", x, hpY - 8 * s);
+    ctx.fillText("HP", x, hpY - 8 * s);
+    ctx.fillStyle = "rgba(0,0,0,0.45)";
+    ctx.fillRect(x, hpY, barW, barH);
+    const hpPct = clamp(player.health / player.maxHealth, 0, 1);
+    ctx.fillStyle = player.health > player.maxHealth * 0.5 ? "#22c55e" : player.health > player.maxHealth * 0.25 ? "#f59e0b" : "#ef4444";
+    ctx.fillRect(x, hpY, barW * hpPct, barH);
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = Math.max(2, 3 * s);
+    ctx.strokeRect(x, hpY, barW, barH);
+    ctx.font = `bold ${valueFont}px ${PIXEL_FONT}`;
+    const hpText = `${Math.ceil(player.health)} / ${player.maxHealth}`;
+    const hpTextW = ctx.measureText(hpText).width;
+    ctx.strokeStyle = "#000000";
+    ctx.lineWidth = Math.max(2, 3 * s);
+    ctx.strokeText(hpText, x + barW / 2 - hpTextW / 2, hpY + barH * 0.75);
+    ctx.fillStyle = "#ffffff";
+    ctx.fillText(hpText, x + barW / 2 - hpTextW / 2, hpY + barH * 0.75);
+
+    ctx.strokeStyle = "#000000";
+    ctx.lineWidth = Math.max(2, 3 * s);
+    ctx.font = `bold ${labelFont}px ${PIXEL_FONT}`;
+    ctx.strokeText("BREATH", x, breathY - 8 * s);
+    ctx.fillStyle = "#ffffff";
+    ctx.fillText("BREATH", x, breathY - 8 * s);
+    ctx.fillStyle = "rgba(0,0,0,0.45)";
+    ctx.fillRect(x, breathY, barW, barH);
+    const breathPct = clamp(player.breathing / player.maxBreathing, 0, 1);
+    ctx.fillStyle = "#06b6d4";
+    ctx.fillRect(x, breathY, barW * breathPct, barH);
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = Math.max(2, 3 * s);
+    ctx.strokeRect(x, breathY, barW, barH);
+    ctx.font = `bold ${valueFont}px ${PIXEL_FONT}`;
+    const breathText = `${Math.floor(player.breathing)} / ${player.maxBreathing}`;
+    const breathTextW = ctx.measureText(breathText).width;
+    ctx.strokeStyle = "#000000";
+    ctx.lineWidth = Math.max(2, 3 * s);
+    ctx.strokeText(breathText, x + barW / 2 - breathTextW / 2, breathY + barH * 0.75);
+    ctx.fillStyle = "#ffffff";
+    ctx.fillText(breathText, x + barW / 2 - breathTextW / 2, breathY + barH * 0.75);
     ctx.restore();
 }
 
 function drawFormsMinimal() {
-    const x = canvas.width - 500; const y = 145;
-    const formsInfo = [ { id: 1, key: "1", name: "1ST FORM: WATER SLASH", req: 40 }, { id: 2, key: "2", name: "2ND FORM: WATER WHEEL", req: 80 }, { id: 3, key: "3", name: "3RD FORM: WHIRLPOOL", req: 100 }, { id: 4, key: "4", name: "4TH FORM: FLOW DANCE", req: 140 }, { id: 5, key: "5", name: "5TH ABILITY: TOTAL CONCENTRATION", req: 0 } ];
-    ctx.save(); ctx.strokeStyle = "#000000"; ctx.lineWidth = 4; ctx.font = `bold 20px ${PIXEL_FONT}`; ctx.strokeText("ABILITIES", x, y - 28); ctx.fillStyle = "#fbbf24"; ctx.fillText("ABILITIES", x, y - 28); ctx.font = `bold 16px ${PIXEL_FONT}`;
+    const s = getHudScale();
+    const panelW = 500 * s;
+    const x = Math.max(12 * s, canvas.width - panelW);
+    const y = 145 * s;
+    const titleFont = Math.max(12, 20 * s);
+    const rowFont = Math.max(10, 16 * s);
+    const dashFont = Math.max(10, 18 * s);
+    const rowGap = 24 * s;
+    const rightOffset = 430 * s;
+    const formsInfo = [
+        { id: 1, key: "1", name: "1ST FORM: WATER SLASH", req: 40 },
+        { id: 2, key: "2", name: "2ND FORM: WATER WHEEL", req: 80 },
+        { id: 3, key: "3", name: "3RD FORM: WHIRLPOOL", req: 100 },
+        { id: 4, key: "4", name: "4TH FORM: FLOW DANCE", req: 140 },
+        { id: 5, key: "5", name: "5TH ABILITY: TOTAL CONCENTRATION", req: 0 }
+    ];
+
+    ctx.save();
+    ctx.strokeStyle = "#000000";
+    ctx.lineWidth = Math.max(2, 4 * s);
+    ctx.font = `bold ${titleFont}px ${PIXEL_FONT}`;
+    ctx.strokeText("ABILITIES", x, y - 28 * s);
+    ctx.fillStyle = "#fbbf24";
+    ctx.fillText("ABILITIES", x, y - 28 * s);
+    ctx.font = `bold ${rowFont}px ${PIXEL_FONT}`;
+
     for (let i = 0; i < formsInfo.length; i++) {
-        const f = formsInfo[i]; const rowY = y + i * 24; let color = "#ffffff"; let rightText = "READY";
-        if (f.id === 5) { if (player.totalConcentrationActive) { color = "#38bdf8"; rightText = `${Math.ceil(player.totalConcentrationTimer / 60)}s`; } else if (player.totalConcentrationCooldown > 0) { color = "#f87171"; rightText = `${Math.ceil(player.totalConcentrationCooldown / 60)}s`; } else { color = "#22c55e"; rightText = "READY"; } } else { const isLocked = player.breathing < f.req; const isSelected = player.selectedForm === f.id; const cd = formCooldowns[f.id]; if (isSelected) color = "#fbbf24"; if (isLocked) { color = "#64748b"; rightText = `REQ ${f.req}`; } else if (cd > 0) { color = "#f87171"; rightText = `${Math.ceil(cd / 60)}s`; } else { rightText = "READY"; } }
-        ctx.strokeStyle = "#000000"; ctx.lineWidth = 4; ctx.strokeText(`${f.key}. ${f.name}`, x, rowY); ctx.fillStyle = color; ctx.fillText(`${f.key}. ${f.name}`, x, rowY); ctx.strokeStyle = "#000000"; ctx.lineWidth = 4; ctx.strokeText(rightText, x + 430, rowY); ctx.fillStyle = rightText === "READY" ? "#22c55e" : color; ctx.fillText(rightText, x + 430, rowY);
+        const f = formsInfo[i];
+        const rowY = y + i * rowGap;
+        let color = "#ffffff";
+        let rightText = "READY";
+        if (f.id === 5) {
+            if (player.totalConcentrationActive) { color = "#38bdf8"; rightText = `${Math.ceil(player.totalConcentrationTimer / 60)}s`; }
+            else if (player.totalConcentrationCooldown > 0) { color = "#f87171"; rightText = `${Math.ceil(player.totalConcentrationCooldown / 60)}s`; }
+            else { color = "#22c55e"; rightText = "READY"; }
+        } else {
+            const isLocked = player.breathing < f.req;
+            const isSelected = player.selectedForm === f.id;
+            const cd = formCooldowns[f.id];
+            if (isSelected) color = "#fbbf24";
+            if (isLocked) { color = "#64748b"; rightText = `REQ ${f.req}`; }
+            else if (cd > 0) { color = "#f87171"; rightText = `${Math.ceil(cd / 60)}s`; }
+            else { rightText = "READY"; }
+        }
+        ctx.strokeStyle = "#000000";
+        ctx.lineWidth = Math.max(2, 4 * s);
+        ctx.strokeText(`${f.key}. ${f.name}`, x, rowY);
+        ctx.fillStyle = color;
+        ctx.fillText(`${f.key}. ${f.name}`, x, rowY);
+        ctx.strokeStyle = "#000000";
+        ctx.lineWidth = Math.max(2, 4 * s);
+        ctx.strokeText(rightText, x + rightOffset, rowY);
+        ctx.fillStyle = rightText === "READY" ? "#22c55e" : color;
+        ctx.fillText(rightText, x + rightOffset, rowY);
     }
-    ctx.strokeStyle = "#000000"; ctx.lineWidth = 4; ctx.font = `bold 18px ${PIXEL_FONT}`; ctx.strokeText(`DASHES: ${player.dashCharges}/${player.maxDashCharges}`, x, y + 118); ctx.fillStyle = "#38bdf8"; ctx.fillText(`DASHES: ${player.dashCharges}/${player.maxDashCharges}`, x, y + 118);
-    if (player.dashCharges < player.maxDashCharges) { ctx.strokeText(`RECHARGE: ${(player.dashRechargeTimer / 60).toFixed(1)}s`, x, y + 142); ctx.fillStyle = "#cbd5e1"; ctx.fillText(`RECHARGE: ${(player.dashRechargeTimer / 60).toFixed(1)}s`, x, y + 142); }
-    if (player.totalConcentrationActive) { ctx.strokeText("TOTAL CONCENTRATION ACTIVE", x, y + 190); ctx.fillStyle = "#38bdf8"; ctx.fillText("TOTAL CONCENTRATION ACTIVE", x, y + 190); }
-    if (player.isGuarding) { ctx.strokeText("GUARDING", x, y + 214); ctx.fillStyle = "#fbbf24"; ctx.fillText("GUARDING", x, y + 214); }
+
+    ctx.strokeStyle = "#000000";
+    ctx.lineWidth = Math.max(2, 4 * s);
+    ctx.font = `bold ${dashFont}px ${PIXEL_FONT}`;
+    ctx.strokeText(`DASHES: ${player.dashCharges}/${player.maxDashCharges}`, x, y + 118 * s);
+    ctx.fillStyle = "#38bdf8";
+    ctx.fillText(`DASHES: ${player.dashCharges}/${player.maxDashCharges}`, x, y + 118 * s);
+    if (player.dashCharges < player.maxDashCharges) {
+        ctx.strokeText(`RECHARGE: ${(player.dashRechargeTimer / 60).toFixed(1)}s`, x, y + 142 * s);
+        ctx.fillStyle = "#cbd5e1";
+        ctx.fillText(`RECHARGE: ${(player.dashRechargeTimer / 60).toFixed(1)}s`, x, y + 142 * s);
+    }
+    if (player.totalConcentrationActive) {
+        ctx.strokeText("TOTAL CONCENTRATION ACTIVE", x, y + 190 * s);
+        ctx.fillStyle = "#38bdf8";
+        ctx.fillText("TOTAL CONCENTRATION ACTIVE", x, y + 190 * s);
+    }
+    if (player.isGuarding) {
+        ctx.strokeText("GUARDING", x, y + 214 * s);
+        ctx.fillStyle = "#fbbf24";
+        ctx.fillText("GUARDING", x, y + 214 * s);
+    }
     ctx.restore();
 }
 
 function drawEnemyProgressBar() {
-    const barW = 700; const barH = 14; const x = canvas.width / 2 - barW / 2; const y = 14; const pct = clamp(score / MAX_PROGRESS_SCORE, 0, 1);
-    ctx.save(); ctx.strokeStyle = "#000000"; ctx.lineWidth = 4; ctx.font = `bold 18px ${PIXEL_FONT}`; ctx.strokeText("DEMON THREAT PATH", x + 200, y); ctx.fillStyle = "#ffffff"; ctx.fillText("DEMON THREAT PATH", x + 200, y);
-    ctx.fillStyle = "rgba(255,255,255,0.22)"; ctx.fillRect(x, y + 13, barW, barH); ctx.fillStyle = "#ef4444"; ctx.fillRect(x, y + 13, barW * pct, barH); ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 2; ctx.strokeRect(x, y + 13, barW, barH);
-    enemyMilestones.forEach((m) => { const mx = x + (m.score / MAX_PROGRESS_SCORE) * barW; const unlocked = score >= m.score; ctx.strokeStyle = "#000000"; ctx.lineWidth = 4; ctx.font = `bold 20px ${PIXEL_FONT}`; ctx.strokeText("☠", mx - 10, y + 9); ctx.fillStyle = unlocked ? "#fbbf24" : "#cbd5e1"; ctx.fillText("☠", mx - 10, y + 9); ctx.strokeStyle = "#000000"; ctx.lineWidth = 3; ctx.font = `bold 14px ${PIXEL_FONT}`; const label = m.score >= 1000 ? `${m.score / 1000}K` : `${m.score}`; ctx.strokeText(label, mx - 15, y + 47); ctx.fillStyle = "#ffffff"; ctx.fillText(label, mx - 15, y + 47); }); ctx.restore();
+    const s = getHudScale();
+    const barW = Math.min(700 * s, canvas.width * 0.62);
+    const barH = Math.max(9, 14 * s);
+    const x = canvas.width / 2 - barW / 2;
+    const y = 14 * s;
+    const pct = clamp(score / MAX_PROGRESS_SCORE, 0, 1);
+    const titleFont = Math.max(10, 18 * s);
+    const skullFont = Math.max(12, 20 * s);
+    const labelFont = Math.max(9, 14 * s);
+
+    ctx.save();
+    ctx.strokeStyle = "#000000";
+    ctx.lineWidth = Math.max(2, 4 * s);
+    ctx.font = `bold ${titleFont}px ${PIXEL_FONT}`;
+    const title = "DEMON THREAT PATH";
+    const titleW = ctx.measureText(title).width;
+    ctx.strokeText(title, x + barW / 2 - titleW / 2, y);
+    ctx.fillStyle = "#ffffff";
+    ctx.fillText(title, x + barW / 2 - titleW / 2, y);
+    ctx.fillStyle = "rgba(255,255,255,0.22)";
+    ctx.fillRect(x, y + 13 * s, barW, barH);
+    ctx.fillStyle = "#ef4444";
+    ctx.fillRect(x, y + 13 * s, barW * pct, barH);
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = Math.max(1, 2 * s);
+    ctx.strokeRect(x, y + 13 * s, barW, barH);
+    enemyMilestones.forEach((m) => {
+        const mx = x + (m.score / MAX_PROGRESS_SCORE) * barW;
+        const unlocked = score >= m.score;
+        ctx.strokeStyle = "#000000";
+        ctx.lineWidth = Math.max(2, 4 * s);
+        ctx.font = `bold ${skullFont}px ${PIXEL_FONT}`;
+        ctx.strokeText("☠", mx - 10 * s, y + 9 * s);
+        ctx.fillStyle = unlocked ? "#fbbf24" : "#cbd5e1";
+        ctx.fillText("☠", mx - 10 * s, y + 9 * s);
+        ctx.strokeStyle = "#000000";
+        ctx.lineWidth = Math.max(1, 3 * s);
+        ctx.font = `bold ${labelFont}px ${PIXEL_FONT}`;
+        const label = m.score >= 1000 ? `${m.score / 1000}K` : `${m.score}`;
+        ctx.strokeText(label, mx - 15 * s, y + 47 * s);
+        ctx.fillStyle = "#ffffff";
+        ctx.fillText(label, mx - 15 * s, y + 47 * s);
+    });
+    ctx.restore();
 }
 
 function drawEnemyRevealPopup() {

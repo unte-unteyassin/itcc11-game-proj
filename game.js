@@ -1464,7 +1464,7 @@ function updateAkazaIntro(realDt) {
         if (akazaIntro.smokeAlpha <= 0.4 && !akazaIntro.playedReveal) { playSound(sfxReveal); akazaIntro.playedReveal = true; }
         if (akazaIntro.smokeAlpha <= 0 && akazaIntro.standingProgress >= 1) { akaza.pose = "standing"; akazaIntro.phase = 5; akazaIntro.timer = 0; } return; 
     }
-    if (akazaIntro.phase === 5) { timeScale = 0.55; akazaIntro.dialogue = "hi be a demon"; if (akazaIntro.timer >= 120) { akazaIntro.phase = 6; akazaIntro.timer = 0; } return; }
+    if (akazaIntro.phase === 5) { timeScale = 0.55; akazaIntro.dialogue = "akaza: hi be a demon"; if (akazaIntro.timer >= 120) { akazaIntro.phase = 6; akazaIntro.timer = 0; } return; }
     if (akazaIntro.phase === 6) { 
         akazaIntro.cameraFocusX = player.x + player.width / 2; akazaIntro.zoomTarget = 1.3; akazaIntro.dialogue = "no"; 
         if (akazaIntro.timer >= 140) { akazaIntro.phase = 7; akazaIntro.timer = 0; bgmTechniqueDeployment.currentTime = 0; bgmTechniqueDeployment.play().catch(()=>{});} 
@@ -1472,7 +1472,7 @@ function updateAkazaIntro(realDt) {
     } 
 
     if (akazaIntro.phase === 7) { 
-        akazaIntro.cameraFocusX = akaza.x + akaza.width / 2; akazaIntro.zoomTarget = 1.4; akazaIntro.dialogue = "i see"; 
+        akazaIntro.cameraFocusX = akaza.x + akaza.width / 2; akazaIntro.zoomTarget = 1.4; akazaIntro.dialogue = "akaza: i see"; 
         if (akazaIntro.timer >= 340) { impactFrameTimer = 10; startCameraShake(50, 45); akazaIntro.phase = 7.1; akazaIntro.timer = 0; } 
         return; 
     }
@@ -1484,7 +1484,7 @@ function updateAkazaIntro(realDt) {
     }
 
     if (akazaIntro.phase === 7.2) { 
-        akazaIntro.cameraFocusX = akaza.x + akaza.width / 2; akazaIntro.zoomTarget = 1.4; akazaIntro.dialogue = "Technique Deployment!"; 
+        akazaIntro.cameraFocusX = akaza.x + akaza.width / 2; akazaIntro.zoomTarget = 1.4; akazaIntro.dialogue = "akaza: Technique Deployment!"; 
         akazaIntro.compassRedAlpha = Math.min(0.85, akazaIntro.compassRedAlpha + 0.08 * realDt); akazaIntro.compassRadius += (1100 - akazaIntro.compassRadius) * 0.08 * realDt;
         if (akazaIntro.timer >= 350) { akazaIntro.phase = 9; akazaIntro.timer = 0; impactFrameTimer = 8; startCameraShake(25, 12); } 
         return; 
@@ -1496,7 +1496,7 @@ function updateAkazaIntro(realDt) {
     }
 
     if (akazaIntro.phase === 9.1) {
-        akazaIntro.dialogue = "Akaza: Compass Needle!"; 
+        akazaIntro.dialogue = "akaza: Compass Needle!"; 
         akazaIntro.compassRedAlpha = Math.max(0, akazaIntro.compassRedAlpha - 0.05 * realDt); akazaIntro.compassBlueAlpha = Math.min(0.85, akazaIntro.compassBlueAlpha + 0.04 * realDt);
         if (akazaIntro.timer >= 295) { akazaIntro.phase = 10; akazaIntro.timer = 0; } 
         return;
@@ -1845,7 +1845,7 @@ function drawAkazaCompass() {
 }
 function drawAkazaSmoke() { if (!akazaIntro.active && akazaIntro.smoke.length <= 0) return; akazaIntro.smoke.forEach((s) => { ctx.save(); ctx.globalAlpha = s.alpha * akazaIntro.smokeAlpha * 0.55; ctx.fillStyle = "#1f2937"; ctx.shadowBlur = 20; ctx.shadowColor = "#020617"; ctx.beginPath(); ctx.arc(s.x - cameraX, s.y, s.radius, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = "rgba(148,163,184,0.28)"; ctx.beginPath(); ctx.arc(s.x - cameraX - s.radius * 0.25, s.y - s.radius * 0.18, s.radius * 0.45, 0, Math.PI * 2); ctx.fill(); ctx.restore(); }); }
 function drawAkazaShockRings() { if (!akazaIntro.active) return; akazaIntro.shockRings.forEach((r) => { ctx.save(); ctx.globalAlpha = r.alpha; ctx.strokeStyle = "#f8fafc"; ctx.lineWidth = 6; ctx.beginPath(); ctx.ellipse(r.x - cameraX, r.y, r.radius * 1.45, r.radius * 0.25, 0, 0, Math.PI * 2); ctx.stroke(); ctx.strokeStyle = "#38bdf8"; ctx.lineWidth = 2; ctx.beginPath(); ctx.ellipse(r.x - cameraX, r.y, r.radius * 1.15, r.radius * 0.16, 0, 0, Math.PI * 2); ctx.stroke(); ctx.restore(); }); }
-function drawAkazaLetterbox() { if (!akazaIntro.active && akazaIntro.letterbox <= 0) return; ctx.save(); const h = akazaIntro.letterbox; ctx.fillStyle = "#000000"; ctx.fillRect(0, 0, canvas.width, h); ctx.fillRect(0, canvas.height - h, canvas.width, h); if (akazaIntro.dialogue) { ctx.textAlign = "center"; ctx.font = `bold 28px ${PIXEL_FONT}`; ctx.strokeStyle = "#000000"; ctx.lineWidth = 5; const dY = canvas.height - h / 2 + 10; ctx.strokeText(akazaIntro.dialogue, canvas.width / 2, dY); ctx.fillStyle = akazaIntro.dialogue.startsWith("Akaza") ? "#f472b6" : "#38bdf8"; ctx.fillText(akazaIntro.dialogue, canvas.width / 2, dY); ctx.textAlign = "start"; } ctx.restore(); }
+function drawAkazaLetterbox() { if (!akazaIntro.active && akazaIntro.letterbox <= 0) return; ctx.save(); const h = akazaIntro.letterbox; ctx.fillStyle = "#000000"; ctx.fillRect(0, 0, canvas.width, h); ctx.fillRect(0, canvas.height - h, canvas.width, h); if (akazaIntro.dialogue) { ctx.textAlign = "center"; ctx.font = `bold 28px ${PIXEL_FONT}`; ctx.strokeStyle = "#000000"; ctx.lineWidth = 5; const dY = canvas.height - h / 2 + 10; ctx.strokeText(akazaIntro.dialogue, canvas.width / 2, dY); ctx.fillStyle = akazaIntro.dialogue.startsWith("akaza") ? "#f472b6" : "#38bdf8"; ctx.fillText(akazaIntro.dialogue, canvas.width / 2, dY); ctx.textAlign = "start"; } ctx.restore(); }
 
 // =====================================================
 // UPDATE PIPELINE

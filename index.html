@@ -3,23 +3,124 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Slayer’s Path</title>
-
+  <title>INFINITY DUEL!!</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="styles.css" />
 </head>
 
 <body>
-  <!-- BLACK START SCREEN -->
-  <div id="splashScreen">
+  <div id="splashScreen" aria-label="Infinity duel welcome screen">
+    <div class="splash-noise"></div>
     <div class="splash-content">
-      <img id="logoImg" src="assets/logo.png" alt="Game Logo" />
-      <p id="pressStart">Click to Start</p>
+      <img class="splash-logo" src="assets/logo.png" alt="Infinity Duel" />
+      <p id="pressStart">CLICK TO START</p>
     </div>
   </div>
 
-  <!-- GAME -->
-  <canvas id="gameCanvas"></canvas>
+  <div id="mainMenu" style="display: none;" data-hover="none" aria-label="Main menu">
+    <div class="bg-layer" id="bgBase"></div>
+    <div class="bg-layer hover-layer" id="bgAkaza"></div>
+    <div class="bg-layer hover-layer" id="bgTanjiro"></div>
+    <div class="menu-vignette"></div>
+    <div class="scanlines"></div>
 
+    <div class="menu-ui">
+      <div class="mode-header">
+        <h1 class="menu-title">INFINITY DUEL</h1>
+      </div>
+
+      <div class="selection-container">
+        <button id="btnBoss" class="mode-btn boss-btn" data-mode="boss">
+          <span class="mode-kicker">BOSS FIGHT</span>
+          <span class="mode-name">AKAZA</span>
+          <span class="mode-desc">boss testing (unfinished lowk :C)</span>
+        </button>
+
+        <button id="btnControls" class="mode-btn controls-btn" data-mode="controls" type="button">
+          <span class="mode-kicker">GUIDE</span>
+          <span class="mode-name">CONTROLS / TIPS</span>
+          <span class="mode-desc">Moves, parry, forms</span>
+        </button>
+
+        <button id="btnArcade" class="mode-btn arcade-btn" data-mode="arcade">
+          <span class="mode-kicker">SURVIVAL</span>
+          <span class="mode-name">ARCADE</span>
+          <span class="mode-desc">Waves of demons till the big bad guy</span>
+        </button>
+      </div>
+
+      <div id="controlsPanel" class="controls-panel" aria-hidden="true">
+        <div class="controls-card">
+          <div class="controls-topline">
+            <h2>CONTROLS / TIPS</h2>
+            <button id="btnCloseControls" class="close-controls" type="button">CLOSE</button>
+          </div>
+
+          <div class="controls-grid">
+            <section>
+              <h3>Movement</h3>
+              <p><b>A / D</b> or <b>← / →</b> - Move left and right.</p>
+              <p><b>W</b> or <b>↑</b> - Jump.</p>
+              <p><b>Q</b> - Dash. You have dash charges and they recharge over time.</p>
+            </section>
+
+            <section>
+              <h3>Combat</h3>
+              <p><b>Left Click</b> - Normal Attack</p>
+              <p><b>Space</b> - To guard, for pure defense</p>
+              <p><b>Perfect Parry</b> - Press guard right before a hit. It heals a little, stuns nearby enemies, gain score, and creates a counter opening</p>
+            </section>
+
+            <section>
+              <h3>Skills</h3>
+              <p><b>G</b> - Focus breathing</p>
+              <p><b>1</b> - First Form: Surface Slash</p>
+              <p><b>2</b> - Second Form: Water Wheel </p>
+              <p><b>3</b> - Third Form: Whirlpool</p>
+              <p><b>4</b> - Fourth Form: Flow Dance</p>
+              <p><b>5</b> - Total Concentration Breathing. Costs your HP but it grants you auto-breathing</p>
+            </section>
+
+            <section>
+              <h3>Arcade Progression</h3>
+              <p><b>15K</b> - Sniper Demon appears. Your max HP cap increases.</p>
+              <p><b>30K</b> - Swift Demon appears. Guard and punish after dash attacks.</p>
+              <p><b>60K</b> - Brute Demon appears. Use forms, not only M1.</p>
+              <p><b>70K</b> - Boss warning. Akaza arrives, max HP cap becomes 485.</p>
+            </section>
+          </div>
+        </div>
+      </div>
+
+      <div id="leaderboard" class="leaderboard-grid">
+        <section class="leaderboard-card boss-board">
+          <div class="leaderboard-heading">
+            <h2>TOP 10 (BOSS)</h2>
+            <span>Firebase-ready</span>
+          </div>
+          <ol id="bossLeaderboardList" class="score-list">
+            <li><span>Loading...</span><b>---</b></li>
+          </ol>
+        </section>
+
+        <section class="leaderboard-card arcade-board">
+          <div class="leaderboard-heading">
+            <h2>TOP 10 (ARCADE)</h2>
+            <span>Firebase-ready</span>
+          </div>
+          <ol id="arcadeLeaderboardList" class="score-list">
+            <li><span>Loading...</span><b>---</b></li>
+          </ol>
+        </section>
+      </div>
+
+      <p id="leaderboardSyncStatus" class="sync-status">Local scores active until Firebase config is added.</p>
+    </div>
+  </div>
+
+  <canvas id="gameCanvas"></canvas>
   <script type="module" src="game.js"></script>
 </body>
 </html>

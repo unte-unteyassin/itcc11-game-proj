@@ -24,12 +24,13 @@ import {
 } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
 
 const firebaseConfig = {
-    apiKey: "YOUR_API_KEY_PLACEHOLDER",
-    authDomain: "YOUR_AUTH_DOMAIN_PLACEHOLDER",
-    projectId: "YOUR_PROJECT_ID_PLACEHOLDER",
-    storageBucket: "YOUR_STORAGE_BUCKET_PLACEHOLDER",
-    messagingSenderId: "YOUR_MESSAGING_SENDER_ID_PLACEHOLDER",
-    appId: "YOUR_APP_ID_PLACEHOLDER"
+  apiKey: "AIzaSyDcHLBdl6FcZQwejQdRYcZ7bB4Wvuad4I0",
+  authDomain: "infinity-duel-e0474.firebaseapp.com",
+  projectId: "infinity-duel-e0474",
+  storageBucket: "infinity-duel-e0474.firebasestorage.app",
+  messagingSenderId: "897660081382",
+  appId: "1:897660081382:web:78bc6886c89dc94ddad727",
+  measurementId: "G-Y2PLDVF0F7"
 };
 
 let firebaseApp = null;

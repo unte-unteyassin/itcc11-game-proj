@@ -70,17 +70,19 @@
               <h3>Combat</h3>
               <p><b>Left Click</b> - Normal Attack</p>
               <p><b>Space</b> - To guard, for pure defense</p>
-              <p><b>Perfect Parry</b> - Press guard right before a hit. It heals a little, stuns nearby enemies, gain score, and creates a counter opening</p>
+              <p><b>Perfect Parry</b> - Press guard right before a hit. It heals a little, stuns nearby enemies, gains score, and creates a counter opening.</p>
+              <p><b>Form Defense</b> - 1st Form is mainly for damage. 2nd Form can deflect projectiles only. 3rd and 4th Form can protect you while the move is being unleashed.</p>
             </section>
 
             <section>
               <h3>Skills</h3>
-              <p><b>G</b> - Focus breathing</p>
+              <p><b>G</b> - Focus breathing. Breath can reach <b>180</b> now.</p>
+              <p><b>F</b> - Total Concentration Breathing. Costs HP but it grants you auto-breathing.</p>
               <p><b>1</b> - First Form: Surface Slash</p>
-              <p><b>2</b> - Second Form: Water Wheel </p>
-              <p><b>3</b> - Third Form: Whirlpool</p>
-              <p><b>4</b> - Fourth Form: Flow Dance</p>
-              <p><b>5</b> - Total Concentration Breathing. Costs your HP but it grants you auto-breathing</p>
+              <p><b>2</b> - Second Form: Water Wheel. Can deflect projectiles, but close physical attacks can still hit you.</p>
+              <p><b>3</b> - Third Form: Whirlpool. Defensive water form that protects you from attacks while it spins.</p>
+              <p><b>4</b> - Fourth Form: Flow Dance. Requires 140 breath. Final water form for offense and defense.</p>
+              <p><b>5</b> - Sun Breathing 1st Form: SUN DANCE. Requires 180 breath, costs HP, huge cooldown, but gives high offense and protects you from damage while it executes.</p>
             </section>
 
             <section>
@@ -88,16 +90,32 @@
               <p><b>15K</b> - Sniper Demon appears. Your max HP cap increases.</p>
               <p><b>30K</b> - Swift Demon appears. Guard and punish after dash attacks.</p>
               <p><b>60K</b> - Brute Demon appears. Use forms, not only M1.</p>
-              <p><b>70K</b> - Boss warning. Akaza arrives, max HP cap becomes 485.</p>
+              <p><b>70K</b> - End of the milestone path. Akaza arrives, max HP cap becomes 485, and beating him ends the run.</p>
             </section>
           </div>
         </div>
       </div>
 
+      <div id="playerScoreSummary" class="player-score-summary" aria-label="Player score summary">
+        <section class="player-score-card boss-score-card">
+          <p class="score-summary-label">CURRENT SCORE (BOSS)</p>
+          <b id="bossCurrentScore">0</b>
+          <p class="score-summary-label highest">HIGHEST SCORE (BOSS)</p>
+          <b id="bossHighestScore" class="highest-score">0</b>
+        </section>
+
+        <section class="player-score-card arcade-score-card">
+          <p class="score-summary-label">CURRENT SCORE (ARCADE)</p>
+          <b id="arcadeCurrentScore">0</b>
+          <p class="score-summary-label highest">HIGHEST SCORE (ARCADE)</p>
+          <b id="arcadeHighestScore" class="highest-score">0</b>
+        </section>
+      </div>
+
       <div id="leaderboard" class="leaderboard-grid">
         <section class="leaderboard-card boss-board">
           <div class="leaderboard-heading">
-            <h2>TOP 10 (BOSS)</h2>
+            <h2>TOP 10 HIGH SCORES (BOSS)</h2>
             <span>Firebase-ready</span>
           </div>
           <ol id="bossLeaderboardList" class="score-list">
@@ -107,7 +125,7 @@
 
         <section class="leaderboard-card arcade-board">
           <div class="leaderboard-heading">
-            <h2>TOP 10 (ARCADE)</h2>
+            <h2>TOP 10 HIGH SCORES (ARCADE)</h2>
             <span>Firebase-ready</span>
           </div>
           <ol id="arcadeLeaderboardList" class="score-list">

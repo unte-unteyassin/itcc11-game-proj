@@ -7,7 +7,10 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebas
 import {
     getFirestore,
     collection,
-    addDoc,
+    doc,
+    setDoc,
+    getDoc,
+    runTransaction,
     query,
     orderBy,
     limit,
@@ -325,10 +328,16 @@ async function handleAuthLogin(createAccount = false) {
 
     const email = String(authEmailInput?.value || "").trim();
     const password = String(authPasswordInput?.value || "");
-    const nickname = cleanLeaderboardName(authNameInput?.value || "");
+    const typedNickname = String(authNameInput?.value || "").trim();
+    const nickname = cleanLeaderboardName(typedNickname || getEmailPrefix(email));
 
     if (!email || !password) {
         updateAuthUI("EMAIL AND PASSWORD ARE REQUIRED.");
+        return;
+    }
+
+    if (createAccount && !typedNickname) {
+        updateAuthUI("NAME TAG REQUIRED FOR SIGN UP.");
         return;
     }
 
@@ -339,12 +348,13 @@ async function handleAuthLogin(createAccount = false) {
             ? await createUserWithEmailAndPassword(auth, email, password)
             : await signInWithEmailAndPassword(auth, email, password);
 
-        if (createAccount && nickname && result.user && !result.user.displayName) {
+        if (result.user && nickname && (createAccount || isBadLeaderboardName(result.user.displayName))) {
             await updateProfile(result.user, { displayName: nickname });
         }
 
         firebaseUser = result.user;
         if (authNameInput && result.user.displayName) authNameInput.value = result.user.displayName;
+        await repairMyLeaderboardName();
         updateAuthUI(createAccount ? "ACCOUNT CREATED. READY." : "LOGIN SUCCESS. READY.");
         await updateLeaderboardUI();
     } catch (error) {
@@ -368,6 +378,7 @@ if (auth) {
     onAuthStateChanged(auth, async (user) => {
         firebaseUser = user || null;
         authReady = true;
+        if (firebaseUser) await repairMyLeaderboardName();
         updateAuthUI();
         await updateLeaderboardUI();
     });
@@ -398,24 +409,112 @@ endContainer.innerHTML = `
 if (!endContainer.parentElement) document.body.appendChild(endContainer);
 
 const defaultLeaderboards = {
-    arcade: [
-        { name: "YORIICHI", score: 150000 },
-        { name: "RENGOKU", score: 65000 },
-        { name: "GIYUU", score: 40000 },
-        { name: "TANJIRO", score: 25000 },
-        { name: "ZENITSU", score: 18000 }
-    ],
-    boss: [
-        { name: "AKAZA", score: 120000 },
-        { name: "YORIICHI", score: 90000 },
-        { name: "GIYUU", score: 70000 },
-        { name: "SLAYER", score: 50000 },
-        { name: "TENGEN", score: 35000 }
-    ]
+    // No fake placeholder scores. Only real saved player scores should appear.
+    arcade: [],
+    boss: []
 };
+
+const VALID_LEADERBOARD_MODES = new Set(["arcade", "boss"]);
+const INVALID_LEADERBOARD_NAMES = new Set([
+    "",
+    "SLAYER",
+    "PLAYER",
+    "UNKNOWN",
+    "UNDEFINED",
+    "NULL",
+    "NONE",
+    "N/A",
+    "GUEST"
+]);
+
+const legacyPlaceholderScores = {
+    arcade: new Set([
+        "YORIICHI:150000",
+        "RENGOKU:65000",
+        "GIYUU:40000",
+        "TANJIRO:25000",
+        "ZENITSU:18000"
+    ]),
+    boss: new Set([
+        "AKAZA:120000",
+        "YORIICHI:90000",
+        "GIYUU:70000",
+        "SLAYER:50000",
+        "TENGEN:35000"
+    ])
+};
+
+function getSafeLeaderboardMode(mode) {
+    return mode === "boss" ? "boss" : "arcade";
+}
+
+function getEmailPrefix(email = "") {
+    const text = String(email || "").trim();
+    if (!text) return "";
+    return text.includes("@") ? text.split("@")[0] : text;
+}
+
+function normalizeNameSource(name = "") {
+    const text = String(name || "").trim();
+    if (!text) return "";
+    return text.includes("@") ? getEmailPrefix(text) : text;
+}
+
+function cleanLeaderboardName(name, fallback = "") {
+    const raw = normalizeNameSource(name) || normalizeNameSource(fallback);
+    return String(raw || "")
+        .trim()
+        .replace(/[^\w !?'-]/g, "")
+        .replace(/\s+/g, " ")
+        .slice(0, 12)
+        .toUpperCase();
+}
+
+function isBadLeaderboardName(name) {
+    const cleaned = cleanLeaderboardName(name);
+    return !cleaned || INVALID_LEADERBOARD_NAMES.has(cleaned);
+}
+
+function getBestPlayerName(preferredName = "") {
+    const candidates = [
+        preferredName,
+        firebaseUser?.displayName,
+        authNameInput?.value,
+        getEmailPrefix(firebaseUser?.email)
+    ];
+
+    for (const candidate of candidates) {
+        const cleaned = cleanLeaderboardName(candidate);
+        if (!isBadLeaderboardName(cleaned)) return cleaned;
+    }
+
+    if (firebaseUser?.uid) {
+        return `P${String(firebaseUser.uid).slice(0, 7).toUpperCase()}`;
+    }
+
+    return "LOCAL";
+}
+
+function isLegacyPlaceholderScore(mode, entry) {
+    if (!entry) return false;
+    const key = `${cleanLeaderboardName(entry.name || entry.displayName)}:${Math.max(0, Math.floor(Number(entry.score) || 0))}`;
+    return legacyPlaceholderScores[mode]?.has(key) || false;
+}
+
+function isBadLeaderboardEntry(mode, entry) {
+    if (!entry) return true;
+    if (!Number.isFinite(Number(entry.score))) return true;
+    if (isLegacyPlaceholderScore(mode, entry)) return true;
+    return isBadLeaderboardName(entry.name || entry.displayName);
+}
+
+function filterLegacyPlaceholderScores(mode, entries = []) {
+    return (entries || []).filter((entry) => !isBadLeaderboardEntry(mode, entry));
+}
 
 let currentMode = "arcade";
 let gameplaySessionId = 0;
+let resultScreenToken = 0;
 let scoreSubmissionLocked = false;
 let endScreenShown = false;
 let localLeaderboard = loadLocalLeaderboards();
@@ -423,21 +522,25 @@ let localLeaderboard = loadLocalLeaderboards();
 function normalizeLeaderboardData(data) {
     if (Array.isArray(data)) {
         return {
-            arcade: data,
-            boss: [...defaultLeaderboards.boss]
+            arcade: filterLegacyPlaceholderScores("arcade", data),
+            boss: []
         };
     }
 
     return {
-        arcade: Array.isArray(data?.arcade) ? data.arcade : [...defaultLeaderboards.arcade],
-        boss: Array.isArray(data?.boss) ? data.boss : [...defaultLeaderboards.boss]
+        arcade: filterLegacyPlaceholderScores("arcade", Array.isArray(data?.arcade) ? data.arcade : []),
+        boss: filterLegacyPlaceholderScores("boss", Array.isArray(data?.boss) ? data.boss : [])
     };
 }
 
 function loadLocalLeaderboards() {
     try {
         const saved = localStorage.getItem("slayer_leaderboards_v2") || localStorage.getItem("slayer_leaderboard");
-        if (saved) return normalizeLeaderboardData(JSON.parse(saved));
+        if (saved) {
+            const cleaned = normalizeLeaderboardData(JSON.parse(saved));
+            try { localStorage.setItem("slayer_leaderboards_v2", JSON.stringify(cleaned)); } catch (_) {}
+            return cleaned;
+        }
     } catch (e) {
         console.warn("Local storage disabled. Leaderboard won't save permanently.", e);
     }
@@ -452,77 +555,389 @@ function saveLocalLeaderboards() {
     }
 }
 
-function cleanLeaderboardName(name) {
-    return String(name || "SLAYER")
-        .trim()
-        .replace(/[^\w !?'-]/g, "")
-        .slice(0, 12)
-        .toUpperCase() || "SLAYER";
+const PLAYER_SCORE_SNAPSHOT_KEY = "slayer_player_score_snapshot_v1";
+
+function getPlayerScoreSnapshotKey() {
+    if (firebaseUser?.uid) return `uid:${firebaseUser.uid}`;
+    const emailKey = getEmailPrefix(firebaseUser?.email);
+    if (emailKey) return `email:${cleanLeaderboardName(emailKey)}`;
+    return "local";
 }
 
-function sortAndTrimLeaderboard(mode) {
-    localLeaderboard[mode] = (localLeaderboard[mode] || [])
-        .filter((entry) => entry && Number.isFinite(Number(entry.score)))
-        .map((entry) => ({
-            name: cleanLeaderboardName(entry.name),
-            score: Math.max(0, Math.floor(Number(entry.score)))
-        }))
-        .sort((a, b) => b.score - a.score)
-        .slice(0, 10);
+function loadPlayerScoreSnapshots() {
+    try {
+        const raw = localStorage.getItem(PLAYER_SCORE_SNAPSHOT_KEY);
+        const parsed = raw ? JSON.parse(raw) : {};
+        return parsed && typeof parsed === "object" ? parsed : {};
+    } catch (_) {
+        return {};
+    }
 }
 
-async function fetchFirebaseLeaderboard(mode) {
+function savePlayerScoreSnapshots(data) {
+    try {
+        localStorage.setItem(PLAYER_SCORE_SNAPSHOT_KEY, JSON.stringify(data || {}));
+    } catch (_) {}
+}
+
+function ensurePlayerScoreSnapshot(mode) {
+    const safeMode = getSafeLeaderboardMode(mode);
+    const data = loadPlayerScoreSnapshots();
+    const playerKey = getPlayerScoreSnapshotKey();
+
+    if (!data[playerKey]) data[playerKey] = {};
+    if (!data[playerKey][safeMode]) {
+        data[playerKey][safeMode] = {
+            current: 0,
+            highest: 0,
+            updatedAt: Date.now()
+        };
+    }
+
+    return { data, playerKey, safeMode, record: data[playerKey][safeMode] };
+}
+
+function recordPlayerCurrentScore(mode, finalScore, options = {}) {
+    const { updateHighest = false } = options;
+    const cleanScore = Math.max(0, Math.floor(Number(finalScore) || 0));
+    const { data, safeMode, record } = ensurePlayerScoreSnapshot(mode);
+
+    record.current = cleanScore;
+    if (updateHighest) record.highest = Math.max(Math.max(0, Math.floor(Number(record.highest) || 0)), cleanScore);
+    record.updatedAt = Date.now();
+
+    savePlayerScoreSnapshots(data);
+    updatePlayerScoreSummaryUI();
+}
+
+function getLocalPlayerScoreSnapshot(mode) {
+    const safeMode = getSafeLeaderboardMode(mode);
+    const data = loadPlayerScoreSnapshots();
+    const playerKey = getPlayerScoreSnapshotKey();
+    const record = data?.[playerKey]?.[safeMode] || {};
+    return {
+        current: Math.max(0, Math.floor(Number(record.current) || 0)),
+        highest: Math.max(0, Math.floor(Number(record.highest) || 0))
+    };
+}
+
+async function fetchMyFirebaseHighScore(mode) {
+    const safeMode = getSafeLeaderboardMode(mode);
     if (!firebaseReady || !db || !firebaseUser) return null;
 
     try {
-        const scoresQuery = query(
-            collection(db, "leaderboards", mode, "scores"),
-            orderBy("score", "desc"),
-            limit(10)
-        );
-
-        const snapshot = await getDocs(scoresQuery);
-        return snapshot.docs.map((doc) => {
-            const data = doc.data();
-            return {
-                name: cleanLeaderboardName(data.name),
-                score: Math.max(0, Math.floor(Number(data.score) || 0))
-            };
-        });
+        const scoreSnap = await getDoc(doc(db, "leaderboards", safeMode, "scores", firebaseUser.uid));
+        if (!scoreSnap.exists()) return 0;
+        return Math.max(0, Math.floor(Number(scoreSnap.data()?.score) || 0));
     } catch (error) {
-        console.warn(`Could not read ${mode} leaderboard from Firebase. Using local data.`, error);
+        console.warn(`Could not read personal ${safeMode} high score from Firebase.`, error);
         return null;
     }
 }
 
-async function submitLeaderboardScore(mode, playerName, finalScore) {
-    const safeMode = mode === "boss" ? "boss" : "arcade";
-    const entry = {
-        name: cleanLeaderboardName(playerName),
-        score: Math.max(0, Math.floor(Number(finalScore) || 0))
-    };
+function setScoreSummaryText(id, value) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = Math.max(0, Math.floor(Number(value) || 0)).toLocaleString();
+}
 
+async function updatePlayerScoreSummaryUI() {
+    const [bossFirebaseHigh, arcadeFirebaseHigh] = await Promise.all([
+        fetchMyFirebaseHighScore("boss"),
+        fetchMyFirebaseHighScore("arcade")
+    ]);
+
+    const bossLocal = getLocalPlayerScoreSnapshot("boss");
+    const arcadeLocal = getLocalPlayerScoreSnapshot("arcade");
+
+    const bossHighest = bossFirebaseHigh !== null ? bossFirebaseHigh : bossLocal.highest;
+    const arcadeHighest = arcadeFirebaseHigh !== null ? arcadeFirebaseHigh : arcadeLocal.highest;
+
+    setScoreSummaryText("bossCurrentScore", bossLocal.current);
+    setScoreSummaryText("bossHighestScore", bossHighest);
+    setScoreSummaryText("arcadeCurrentScore", arcadeLocal.current);
+    setScoreSummaryText("arcadeHighestScore", arcadeHighest);
+}
+
+function getLeaderboardEntryKey(entry) {
+    const uid = String(entry?.uid || entry?.playerKey || "").trim();
+    if (uid && !uid.startsWith("name:")) return `uid:${uid}`;
+    return `name:${cleanLeaderboardName(entry?.name || entry?.displayName)}`;
+}
+
+function normalizeLeaderboardEntry(mode, entry) {
+    if (!entry || !Number.isFinite(Number(entry.score))) return null;
+    if (isLegacyPlaceholderScore(mode, entry)) return null;
+
+    const cleanScore = Math.max(0, Math.floor(Number(entry.score) || 0));
+    const rawUid = String(entry.uid || entry.playerKey || "").trim();
+    const uid = rawUid && !rawUid.startsWith("name:") ? rawUid : "";
+
+    let cleanName = cleanLeaderboardName(entry.name || entry.displayName || entry.email);
+    if (isBadLeaderboardName(cleanName) && uid && firebaseUser?.uid === uid) {
+        cleanName = getBestPlayerName("");
+    }
+
+    if (isBadLeaderboardName(cleanName)) return null;
+
+    return {
+        name: cleanName,
+        score: cleanScore,
+        uid: uid || null,
+        playerKey: uid || cleanName
+    };
+}
+
+function mergeLeaderboardEntries(mode, ...entryLists) {
+    const bestByUidOrName = new Map();
+
+    entryLists.flat().forEach((rawEntry) => {
+        const entry = normalizeLeaderboardEntry(mode, rawEntry);
+        if (!entry) return;
+
+        const key = getLeaderboardEntryKey(entry);
+        const old = bestByUidOrName.get(key);
+        if (!old || entry.score > old.score) bestByUidOrName.set(key, entry);
+    });
+
+    // Second pass collapses old random Firestore docs that have the same name but missing/old UID fields.
+    // This keeps the visible leaderboard logical: one visible high score per player name.
+    const bestByVisibleName = new Map();
+    [...bestByUidOrName.values()].forEach((entry) => {
+        const nameKey = cleanLeaderboardName(entry.name);
+        const old = bestByVisibleName.get(nameKey);
+        if (!old || entry.score > old.score) bestByVisibleName.set(nameKey, entry);
+    });
+
+    return [...bestByVisibleName.values()]
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 10);
+}
+
+function sortAndTrimLeaderboard(mode) {
+    localLeaderboard[mode] = mergeLeaderboardEntries(mode, localLeaderboard[mode] || []);
+}
+
+async function ensureLeaderboardParentDocs() {
+    if (!firebaseReady || !db || !firebaseUser) return;
+    try {
+        await Promise.all(["arcade", "boss"].map((mode) => (
+            setDoc(doc(db, "leaderboards", mode), {
+                mode,
+                updatedAt: serverTimestamp()
+            }, { merge: true })
+        )));
+    } catch (error) {
+        // This is cosmetic only. Scores still work even if the parent document is missing in the console.
+        console.warn("Could not create leaderboard parent docs. This does not block scores.", error);
+    }
+}
+
+async function repairMyLeaderboardName() {
+    if (!firebaseReady || !db || !firebaseUser) return;
+
+    const goodName = getBestPlayerName("");
+    if (isBadLeaderboardName(goodName)) return;
+
+    try {
+        await ensureLeaderboardParentDocs();
+
+        for (const mode of ["arcade", "boss"]) {
+            const scoreRef = doc(db, "leaderboards", mode, "scores", firebaseUser.uid);
+            const scoreSnap = await getDoc(scoreRef);
+            if (!scoreSnap.exists()) continue;
+
+            const data = scoreSnap.data();
+            const oldName = cleanLeaderboardName(data.name || data.displayName);
+            const currentScore = Math.max(0, Math.floor(Number(data.score) || 0));
+
+            if (isBadLeaderboardName(oldName) || data.uid !== firebaseUser.uid || data.mode !== mode) {
+                await setDoc(scoreRef, {
+                    name: goodName,
+                    displayName: goodName,
+                    score: currentScore,
+                    mode,
+                    uid: firebaseUser.uid,
+                    updatedAt: serverTimestamp()
+                }, { merge: true });
+            }
+        }
+    } catch (error) {
+        console.warn("Could not repair your leaderboard name yet.", error);
+    }
+}
+
+async function fetchFirebaseLeaderboard(mode) {
+    const safeMode = getSafeLeaderboardMode(mode);
+    if (!firebaseReady || !db) return null;
+
+    try {
+        const scoresQuery = query(
+            collection(db, "leaderboards", safeMode, "scores"),
+            orderBy("score", "desc"),
+            limit(100)
+        );
+
+        const snapshot = await getDocs(scoresQuery);
+        const entries = snapshot.docs.map((scoreDoc) => {
+            const data = scoreDoc.data();
+            const uid = String(data.uid || scoreDoc.id || "").trim();
+            const name = data.name || data.displayName || "";
+
+            return {
+                name,
+                displayName: data.displayName || name,
+                score: Math.max(0, Math.floor(Number(data.score) || 0)),
+                uid,
+                playerKey: uid || scoreDoc.id
+            };
+        });
+
+        return mergeLeaderboardEntries(safeMode, entries);
+    } catch (error) {
+        console.warn(`Could not read ${safeMode} leaderboard from Firebase. Using local data.`, error);
+        return null;
+    }
+}
+
+function saveLocalHighScore(safeMode, entry) {
     if (!localLeaderboard[safeMode]) localLeaderboard[safeMode] = [];
-    localLeaderboard[safeMode].push(entry);
+
+    const cleanEntry = normalizeLeaderboardEntry(safeMode, entry);
+    if (!cleanEntry) return false;
+
+    const entryKey = getLeaderboardEntryKey(cleanEntry);
+    const existing = localLeaderboard[safeMode].find((old) => getLeaderboardEntryKey(old) === entryKey);
+    const oldScore = existing ? Math.max(0, Math.floor(Number(existing.score) || 0)) : -1;
+
+    if (!existing || cleanEntry.score > oldScore) {
+        if (existing) {
+            existing.name = cleanEntry.name;
+            existing.score = cleanEntry.score;
+            existing.uid = cleanEntry.uid || existing.uid || null;
+            existing.playerKey = cleanEntry.playerKey || existing.playerKey || cleanEntry.name;
+        } else {
+            localLeaderboard[safeMode].push({ ...cleanEntry });
+        }
+
+        sortAndTrimLeaderboard(safeMode);
+        saveLocalLeaderboards();
+        return true;
+    }
+
     sortAndTrimLeaderboard(safeMode);
     saveLocalLeaderboards();
+    return false;
+}
+
+async function submitLeaderboardScore(mode, playerName, finalScore) {
+    const safeMode = getSafeLeaderboardMode(mode);
+    const uid = firebaseUser?.uid || null;
+    const entry = {
+        name: getBestPlayerName(playerName),
+        score: Math.max(0, Math.floor(Number(finalScore) || 0)),
+        uid,
+        playerKey: uid || getBestPlayerName(playerName)
+    };
+
+    recordPlayerCurrentScore(safeMode, entry.score, { updateHighest: false });
+
+    if (isBadLeaderboardName(entry.name)) {
+        return {
+            entry,
+            localImproved: false,
+            firebaseImproved: false,
+            firebaseStatus: "bad_name",
+            improved: false,
+            previousHighScore: 0,
+            savedHighScore: 0
+        };
+    }
+
+    const localBefore = getLocalPlayerScoreSnapshot(safeMode).highest;
+    const localImproved = saveLocalHighScore(safeMode, entry);
+    if (localImproved) recordPlayerCurrentScore(safeMode, entry.score, { updateHighest: true });
+
+    let firebaseStatus = firebaseReady && db && firebaseUser ? "not_improved" : "offline";
+    let firebaseImproved = false;
+    let previousHighScore = localBefore;
+    let savedHighScore = Math.max(localBefore, entry.score);
 
     if (firebaseReady && db && firebaseUser) {
         try {
-            await addDoc(collection(db, "leaderboards", safeMode, "scores"), {
-                name: entry.name,
-                score: entry.score,
-                mode: safeMode,
-                uid: firebaseUser ? firebaseUser.uid : null,
-                displayName: firebaseUser ? (firebaseUser.displayName || firebaseUser.email || entry.name) : entry.name,
-                createdAt: serverTimestamp()
+            await ensureLeaderboardParentDocs();
+
+            const scoreRef = doc(db, "leaderboards", safeMode, "scores", firebaseUser.uid);
+
+            const transactionResult = await runTransaction(db, async (transaction) => {
+                const existingSnap = await transaction.get(scoreRef);
+                const existingScore = existingSnap.exists()
+                    ? Math.max(0, Math.floor(Number(existingSnap.data().score) || 0))
+                    : -1;
+
+                const oldName = existingSnap.exists()
+                    ? cleanLeaderboardName(existingSnap.data().name || existingSnap.data().displayName)
+                    : "";
+
+                const shouldUpdateScore = entry.score > existingScore;
+                const shouldRepairName = isBadLeaderboardName(oldName) || oldName !== entry.name;
+
+                if (!shouldUpdateScore && !shouldRepairName) {
+                    return {
+                        improved: false,
+                        previousHighScore: Math.max(0, existingScore),
+                        savedHighScore: Math.max(0, existingScore)
+                    };
+                }
+
+                const scoreData = {
+                    name: entry.name,
+                    score: shouldUpdateScore ? entry.score : existingScore,
+                    mode: safeMode,
+                    uid: firebaseUser.uid,
+                    displayName: entry.name,
+                    updatedAt: serverTimestamp()
+                };
+
+                if (!existingSnap.exists()) scoreData.createdAt = serverTimestamp();
+                transaction.set(scoreRef, scoreData, { merge: true });
+
+                return {
+                    improved: shouldUpdateScore,
+                    previousHighScore: Math.max(0, existingScore),
+                    savedHighScore: Math.max(0, shouldUpdateScore ? entry.score : existingScore)
+                };
             });
+
+            firebaseImproved = Boolean(transactionResult.improved);
+            previousHighScore = transactionResult.previousHighScore;
+            savedHighScore = transactionResult.savedHighScore;
+            firebaseStatus = firebaseImproved ? "saved" : "not_improved";
+
+            if (firebaseImproved) {
+                recordPlayerCurrentScore(safeMode, entry.score, { updateHighest: true });
+            }
         } catch (error) {
-            console.warn("Firebase score submit failed. Your score was saved locally instead.", error);
+            firebaseStatus = "failed";
+            console.warn("Firebase score submit failed. Your high score was saved locally instead.", error);
         }
     }
 
-    return entry;
+    // Firebase is the official source when logged in. Local backup should not lie and say
+    // "new high score" if Firebase says the old score is still higher.
+    const improved = firebaseReady && db && firebaseUser
+        ? firebaseImproved
+        : localImproved;
+
+    return {
+        entry,
+        localImproved,
+        firebaseImproved,
+        firebaseStatus,
+        improved,
+        previousHighScore,
+        savedHighScore
+    };
 }
 
 function renderLeaderboardList(listId, entries) {
@@ -530,17 +945,18 @@ function renderLeaderboardList(listId, entries) {
     if (!list) return;
 
     const safeEntries = (entries || [])
-        .filter((entry) => entry && Number.isFinite(Number(entry.score)))
+        .map((entry) => normalizeLeaderboardEntry(listId.includes("boss") ? "boss" : "arcade", entry))
+        .filter(Boolean)
         .slice(0, 10);
 
     if (safeEntries.length === 0) {
-        list.innerHTML = `<li><span>NO SCORES</span><b>---</b></li>`;
+        list.innerHTML = `<li><span>NO SCORES YET</span><b>---</b></li>`;
         return;
     }
 
     list.innerHTML = safeEntries.map((entry) => `
         <li>
-            <span>${cleanLeaderboardName(entry.name)}</span>
+            <span>${entry.name}</span>
             <b>${Math.max(0, Math.floor(Number(entry.score))).toLocaleString()}</b>
         </li>
     `).join("");
@@ -555,50 +971,64 @@ async function updateLeaderboardUI() {
         fetchFirebaseLeaderboard("boss")
     ]);
 
-    renderLeaderboardList("arcadeLeaderboardList", firebaseArcade || localLeaderboard.arcade);
-    renderLeaderboardList("bossLeaderboardList", firebaseBoss || localLeaderboard.boss);
+    // If Firebase reads successfully, Firebase is the source of truth.
+    // Local backup is only shown when Firebase cannot be read.
+    const arcadeEntries = firebaseArcade !== null ? firebaseArcade : mergeLeaderboardEntries("arcade", localLeaderboard.arcade || []);
+    const bossEntries = firebaseBoss !== null ? firebaseBoss : mergeLeaderboardEntries("boss", localLeaderboard.boss || []);
+
+    renderLeaderboardList("arcadeLeaderboardList", arcadeEntries);
+    renderLeaderboardList("bossLeaderboardList", bossEntries);
+    await updatePlayerScoreSummaryUI();
 
     // Backward compatibility for older HTML that still has one <ul id="lbList">.
-    renderLeaderboardList("lbList", firebaseArcade || localLeaderboard.arcade);
+    renderLeaderboardList("lbList", arcadeEntries);
 
     const status = document.getElementById("leaderboardSyncStatus");
     if (status) {
-        status.textContent = firebaseReady
-            ? "Firebase leaderboard sync active."
-            : "Local scores active until Firebase config is added.";
+        if (firebaseReady) status.textContent = "Firebase leaderboard sync active.";
+        else status.textContent = "Local scores active until Firebase config is added.";
     }
 }
 
 // Dev-only local test: run seedTestLeaderboardScores("arcade", 35) in the browser console.
 // It proves 20-30+ entries won't break the leaderboard because it still displays only the top 10.
 window.seedTestLeaderboardScores = async function(mode = "arcade", count = 35) {
-    const safeMode = mode === "boss" ? "boss" : "arcade";
+    const safeMode = getSafeLeaderboardMode(mode);
     if (!localLeaderboard[safeMode]) localLeaderboard[safeMode] = [];
+
     for (let i = 0; i < count; i++) {
         localLeaderboard[safeMode].push({
             name: `TEST${String(i + 1).padStart(2, "0")}`,
-            score: Math.floor(Math.random() * 250000)
+            score: Math.floor(Math.random() * 250000),
+            uid: `test-${safeMode}-${i + 1}`
         });
     }
+
     sortAndTrimLeaderboard(safeMode);
     saveLocalLeaderboards();
     await updateLeaderboardUI();
     console.log(`${safeMode.toUpperCase()} leaderboard tested with ${count} fake local scores. Showing top 10 only.`);
 };
 
+window.clearLocalLeaderboardBackup = async function() {
+    localLeaderboard = normalizeLeaderboardData(defaultLeaderboards);
+    try {
+        localStorage.removeItem("slayer_leaderboard");
+        localStorage.removeItem(PLAYER_SCORE_SNAPSHOT_KEY);
+        localStorage.setItem("slayer_leaderboards_v2", JSON.stringify(localLeaderboard));
+    } catch (_) {}
+    await updateLeaderboardUI();
+    console.log("Local leaderboard backup cleared. Firebase scores are untouched.");
+};
+
+window.repairMyLeaderboardName = repairMyLeaderboardName;
+
 function getLoggedInScoreName() {
-    const displayName = firebaseUser?.displayName || "";
-    const emailName = firebaseUser?.email ? firebaseUser.email.split("@")[0] : "";
-    const fallbackName = authNameInput?.value || "";
-    return cleanLeaderboardName(displayName || fallbackName || emailName || "SLAYER");
+    return getBestPlayerName("");
 }
 
 function getResultScoreName() {
-    // Save using the logged-in account internally, but never display the nametag in the result box.
-    if (firebaseReady && firebaseUser) return getLoggedInScoreName();
-
-    const fallbackName = authNameInput?.value || "";
-    return cleanLeaderboardName(fallbackName || "SLAYER");
+    return getBestPlayerName("");
 }
 
 function prefillResultName() {
@@ -610,27 +1040,119 @@ function prefillResultName() {
     if (lockedNameLabel) lockedNameLabel.remove();
 }
 
-async function returnToMenuAfterRun() {
-    stopBreathingSoundAfterCurrentFile();
-    stopBattleMusic();
-    stopBossMusic();
-    gameplaySessionId++;
-    resetInputState();
-    resetRunVisualAndCutsceneState();
-    pausePausedAudios = [];
+
+function hideResultScreenHard() {
+    resultScreenToken++;
+
+    const endScreen = document.getElementById("endScreen");
+    if (endScreen) {
+        endScreen.style.display = "none";
+        endScreen.style.pointerEvents = "none";
+        endScreen.classList.remove("active");
+    }
+
+    const submitButton = document.getElementById("btnSubmitScore");
+    if (submitButton) {
+        submitButton.disabled = false;
+        submitButton.textContent = "SAVE SCORE";
+    }
+
+    const saveStatus = document.getElementById("endSaveStatus");
+    if (saveStatus) saveStatus.textContent = "Save your score or return to menu.";
+}
+
+function resetCanvasContextState() {
+    try {
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.globalAlpha = 1;
+        ctx.globalCompositeOperation = "source-over";
+        ctx.filter = "none";
+        ctx.shadowBlur = 0;
+        ctx.shadowColor = "transparent";
+        ctx.lineWidth = 1;
+    } catch (_) {}
+}
+
+function clearGameplayCanvas() {
+    try {
+        resetCanvasContextState();
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+    } catch (_) {}
+}
+
+function forceShowMenu() {
+    if (!menuContainer) return;
+    menuContainer.style.display = "flex";
+    menuContainer.style.opacity = "";
+    menuContainer.style.pointerEvents = "auto";
+    menuContainer.classList.remove("menu-launching");
+    requestAnimationFrame(() => menuContainer.classList.add("menu-active"));
+}
+
+function forceHideMenuForGameplay() {
+    if (!menuContainer) return;
+    menuContainer.classList.remove("menu-active", "menu-launching");
+    menuContainer.style.opacity = "";
+    menuContainer.style.pointerEvents = "none";
+    menuContainer.style.display = "none";
+}
+
+function resetRoundFlagsForFreshStart() {
+    resultScreenToken++;
     gameOver = false;
     gameWon = false;
     endSequenceTimer = 0;
     endScreenShown = false;
     scoreSubmissionLocked = false;
+    pauseScoreSubmissionLocked = false;
+    endMusicStopped = false;
+    timeScale = 1;
+    globalDt = 1;
+    lastTime = performance.now();
+
+    score = 0;
+    combo = 0;
+    comboTimer = 0;
+    spawnTimer = 0;
+    damageFlashTimer = 0;
+    impactFrameTimer = 0;
+    lightImpactFrameTimer = 0;
+    shakeTimer = 0;
+    shakeStrength = 0;
+    screenShakeX = 0;
+    screenShakeY = 0;
+    cameraX = 0;
+
+    const pauseOverlay = document.getElementById("pauseOverlay");
+    if (pauseOverlay) pauseOverlay.classList.remove("open");
+
+    hideResultScreenHard();
+    stopAllGameplayAudio();
+    resetInputState();
+}
+
+async function returnToMenuAfterRun() {
+    // Hard reset everything that can freeze a new run.
+    // This prevents the death/victory frame, paused sounds, timers, and result overlays from carrying into another mode.
+    gameplaySessionId++;
+    resetRoundFlagsForFreshStart();
+    resetRunVisualAndCutsceneState();
+
+    gameOver = false;
+    gameWon = false;
+    endSequenceTimer = 0;
+    endScreenShown = false;
+    scoreSubmissionLocked = false;
+    pauseScoreSubmissionLocked = false;
+    endMusicStopped = false;
+    timeScale = 1;
+
+    clearGameplayCanvas();
     gameState = "menu";
 
-    const endScreen = document.getElementById("endScreen");
-    if (endScreen) endScreen.style.display = "none";
+    hideResultScreenHard();
 
-    menuContainer.style.display = "flex";
-    menuContainer.classList.remove("menu-launching");
-    requestAnimationFrame(() => menuContainer.classList.add("menu-active"));
+    forceShowMenu();
     await updateLeaderboardUI();
 
     if (bgmMenuTheme) {
@@ -652,12 +1174,17 @@ if (submitScoreButton) {
 
         const name = getResultScoreName();
 
-        await submitLeaderboardScore(currentMode, name, score);
+        const saveResult = await submitLeaderboardScore(currentMode, name, score);
         await updateLeaderboardUI();
 
         submitScoreButton.textContent = "SAVED!";
-        if (status) status.textContent = "Score saved. Returning to menu...";
-        setTimeout(() => returnToMenuAfterRun(), 700);
+        if (status) {
+            if (saveResult.firebaseStatus === "failed") status.textContent = "Firebase failed. Local backup saved if this was higher.";
+            else if (saveResult.firebaseStatus === "bad_name") status.textContent = "Score not saved. Your account name is invalid.";
+            else if (saveResult.improved) status.textContent = "New high score saved. Returning to menu...";
+            else status.textContent = "Your saved high score is still higher. Returning to menu...";
+        }
+        setTimeout(() => returnToMenuAfterRun(), 900);
     };
 }
 
@@ -763,7 +1290,15 @@ function ensurePauseOverlay() {
 
 function pauseGameplayAudio() {
     pausePausedAudios = [];
-    [bgmTechniqueDeployment, bgmBossTheme, sfxBreathing].forEach((audioFile) => {
+
+    getPersistentGameplayAudios().forEach((audioFile) => {
+        if (audioFile && !audioFile.paused) {
+            pausePausedAudios.push(audioFile);
+            audioFile.pause();
+        }
+    });
+
+    activeSoundClones.forEach((audioFile) => {
         if (audioFile && !audioFile.paused) {
             pausePausedAudios.push(audioFile);
             audioFile.pause();
@@ -772,6 +1307,11 @@ function pauseGameplayAudio() {
 }
 
 function resumeGameplayAudio() {
+    if (gameState !== "playing" || gameOver || gameWon) {
+        pausePausedAudios = [];
+        return;
+    }
+
     pausePausedAudios.forEach((audioFile) => {
         if (audioFile) audioFile.play().catch(() => {});
     });
@@ -786,17 +1326,61 @@ function resetInputState() {
     keys.Space = false;
     player.isGuarding = false;
     player.guardFrame = 0;
+    player.formParryLock = 0;
+}
+
+function resetFormCooldowns() {
+    if (typeof formCooldowns === "undefined") return;
+    for (const key in formCooldowns) formCooldowns[key] = 0;
+}
+
+function cancelPlayerActionState(options = {}) {
+    const { resetCooldowns = false, clearTrails = false } = options;
+
+    resetInputState();
+    player.isAttacking = false;
+    player.attackFrame = 0;
+    player.currentForm = 0;
+    player.selectedForm = 0;
+    player.m1AlreadyHit = false;
+    player.sunSecondHitReset = false;
+    player.sunImpactLock = false;
+    player.isDashing = false;
+    player.dashTimer = 0;
+    player.isStunned = false;
+    player.stunTimer = 0;
+    player.invincibleTimer = 0;
+    player.bodyRotation = 0;
+    player.attackBox = { x: 0, y: 0, width: 90, height: 60 };
+    if (player.hitTargets && typeof player.hitTargets.clear === "function") player.hitTargets.clear();
+
+    if (player.y > player.baseY || Math.abs(player.y - player.baseY) < 6) {
+        player.y = player.baseY;
+        player.vy = 0;
+        player.isGrounded = true;
+    }
+
+    if (resetCooldowns) resetFormCooldowns();
+    if (clearTrails) {
+        if (typeof waterTrails !== "undefined") waterTrails.length = 0;
+        if (typeof foamParticles !== "undefined") foamParticles.length = 0;
+        if (typeof clashSparks !== "undefined") clashSparks.length = 0;
+        if (typeof parrySlashes !== "undefined") parrySlashes.length = 0;
+    }
 }
 
 function resetRunVisualAndCutsceneState() {
     stopBreathingSoundAfterCurrentFile();
+    cancelPlayerActionState({ resetCooldowns: true, clearTrails: true });
 
     demons.length = 0;
     projectiles.length = 0;
     healthDrops.length = 0;
     shockwaves.length = 0;
+    afterglowFistStreaks.length = 0;
     clashSparks.length = 0;
     parrySlashes.length = 0;
+    afterglowFistStreaks.length = 0;
     waterTrails.length = 0;
     foamParticles.length = 0;
     jumpBursts.length = 0;
@@ -843,6 +1427,8 @@ function resetRunVisualAndCutsceneState() {
     screenShakeX = 0;
     screenShakeY = 0;
     cameraX = 0;
+    timeScale = 1;
+    endMusicStopped = false;
 }
 
 function pauseGame() {
@@ -865,13 +1451,7 @@ function resumeGameFromPause() {
 
 function getNameForPauseSave() {
     // Save internally without asking/displaying the player's nametag.
-    const firebaseName = firebaseUser?.displayName || firebaseUser?.email;
-    if (firebaseName) return firebaseName;
-
-    const typedName = authNameInput?.value || "";
-    if (typedName && typedName.trim()) return typedName;
-
-    return "SLAYER";
+    return getBestPlayerName("");
 }
 
 async function leaveCurrentRun(saveScore) {
@@ -885,27 +1465,29 @@ async function leaveCurrentRun(saveScore) {
     if (noSaveButton) noSaveButton.disabled = true;
     if (resumeButton) resumeButton.disabled = true;
 
+    recordPlayerCurrentScore(currentMode, score, { updateHighest: false });
+
     if (saveScore) {
         if (saveButton) saveButton.textContent = "SAVING...";
         await submitLeaderboardScore(currentMode, getNameForPauseSave(), score);
         await updateLeaderboardUI();
     }
 
-    stopBreathingSoundAfterCurrentFile();
-    stopBattleMusic();
-    stopBossMusic();
     gameplaySessionId++;
-    resetInputState();
+    resetRoundFlagsForFreshStart();
     resetRunVisualAndCutsceneState();
-    pausePausedAudios = [];
+
     gameOver = false;
     gameWon = false;
     endSequenceTimer = 0;
     endScreenShown = false;
+    scoreSubmissionLocked = false;
+    pauseScoreSubmissionLocked = false;
     gameState = "menu";
+    timeScale = 1;
 
-    const endScreen = document.getElementById("endScreen");
-    if (endScreen) endScreen.style.display = "none";
+    hideResultScreenHard();
+    clearGameplayCanvas();
 
     const pauseOverlay = document.getElementById("pauseOverlay");
     if (pauseOverlay) pauseOverlay.classList.remove("open");
@@ -916,11 +1498,8 @@ async function leaveCurrentRun(saveScore) {
     }
     if (noSaveButton) noSaveButton.disabled = false;
     if (resumeButton) resumeButton.disabled = false;
-    pauseScoreSubmissionLocked = false;
 
-    menuContainer.style.display = "flex";
-    menuContainer.classList.remove("menu-launching");
-    requestAnimationFrame(() => menuContainer.classList.add("menu-active"));
+    forceShowMenu();
     await updateLeaderboardUI();
 
     // Restart menu music after leaving a paused run.
@@ -974,45 +1553,75 @@ function startGameFromSplash() {
 if (splashEl) splashEl.addEventListener("click", startGameFromSplash);
 
 function startGameplay(mode) {
+    // Fresh session every time. This is the important anti-freeze reset.
     gameplaySessionId++;
     const startSessionId = gameplaySessionId;
+
+    resetRoundFlagsForFreshStart();
+    resetRunVisualAndCutsceneState();
+    clearGameplayCanvas();
+
     currentMode = mode === "boss" ? "boss" : "arcade";
     BOSS_TEST_MODE = (currentMode === "boss");
     closeControlsPanel();
     stopMenuMusic();
-    stopBattleMusic();
-    stopBossMusic();
-    resetRunVisualAndCutsceneState();
+    stopAllGameplayAudio();
+
     gameState = "playing";
+    timeScale = 1;
+    globalDt = 1;
+    lastTime = performance.now();
     endMusicStopped = false;
-    menuContainer.classList.remove("menu-active");
-    menuContainer.classList.add("menu-launching");
-    setTimeout(() => {
-        if (gameplaySessionId !== startSessionId || gameState !== "playing") return;
-        menuContainer.style.display = "none";
-        menuContainer.classList.remove("menu-launching");
-    }, 520);
-    
-    score = 0; combo = 0; spawnTimer = 0; endSequenceTimer = 0; damageFlashTimer = 0;
-    gameOver = false; gameWon = false; endScreenShown = false; scoreSubmissionLocked = false;
-    const endScreen = document.getElementById("endScreen");
-    if (endScreen) endScreen.style.display = "none";
+
+    // Hide the menu immediately. The old delayed fade could leave an invisible
+    // full-screen menu over the canvas after a death/victory restart, which made
+    // the new run look like a black screen.
+    forceHideMenuForGameplay();
+
+    score = 0;
+    combo = 0;
+    comboTimer = 0;
+    spawnTimer = 0;
+    endSequenceTimer = 0;
+    damageFlashTimer = 0;
+    gameOver = false;
+    gameWon = false;
+    endScreenShown = false;
+    scoreSubmissionLocked = false;
+    pauseScoreSubmissionLocked = false;
+
+    hideResultScreenHard();
+
     const submitButton = document.getElementById("btnSubmitScore");
-    if (submitButton) { submitButton.disabled = false; submitButton.textContent = "SAVE SCORE"; }
+    if (submitButton) {
+        submitButton.disabled = false;
+        submitButton.textContent = "SAVE SCORE";
+    }
+
     const saveStatus = document.getElementById("endSaveStatus");
     if (saveStatus) saveStatus.textContent = "Save your score or return to menu.";
-    
+
     player.maxHealth = BOSS_TEST_MODE ? 485 : 100;
     player.health = player.maxHealth;
     player.breathing = 60;
-    player.x = 400; player.y = player.baseY; player.isGrounded = true;
-    
+    player.x = 400;
+    player.y = player.baseY;
+    player.vy = 0;
+    player.isGrounded = true;
+    player.invincibleTimer = 0;
+    player.isGuarding = false;
+    player.isDashing = false;
+    player.isAttacking = false;
+    player.currentForm = 0;
+    player.selectedForm = 0;
+    player.hitTargets.clear();
+
     enemyMilestones.forEach(m => m.revealed = false);
-    
+
     if (bgmBossTheme) bgmBossTheme.volume = 0.6;
     if (bgmTechniqueDeployment) bgmTechniqueDeployment.volume = 0.8;
     // Battle music is disabled for now. Menu music only before gameplay; boss music still starts during Akaza.
-    
+
     if (BOSS_TEST_MODE) {
         // Boss mode skips straight to Akaza, but score starts at 0 so it is fair.
         score = 0;
@@ -1044,6 +1653,7 @@ const sfxReveal = new Audio("audio/enemy_reveal.mp3");
 const sfxAkazaLanding = new Audio("audio/akaza_landing.mp3");
 const sfxAkazaVoice = new Audio("audio/akaza_intro.mp3");
 const sfxTotalConcentration = new Audio("audio/ability_call_5.mp3"); sfxTotalConcentration.volume = 1;
+const sfxSunDance = new Audio("audio/sun_dance.mp3"); sfxSunDance.volume = 0.9;
 const sfxAirType = new Audio("audio/air_type.mp3");
 const sfxLegType = new Audio("audio/leg_type.mp3");
 const sfxDisorder = new Audio("audio/disorder.mp3");
@@ -1106,12 +1716,60 @@ sfxBreathing.addEventListener("ended", () => {
     }
 });
 
+const activeSoundClones = new Set();
+
+function shouldBlockGameplaySound() {
+    return gameState === "paused" || gameOver || gameWon || endScreenShown;
+}
+
 function playSound(audioFile) {
-    if (!audioFile) return;
+    if (!audioFile || shouldBlockGameplaySound()) return;
+
     const s = audioFile.cloneNode();
     s.volume = audioFile.volume || 1;
-    s.play().catch(() => {});
-    s.onended = () => { s.remove(); };
+    activeSoundClones.add(s);
+
+    const cleanup = () => {
+        activeSoundClones.delete(s);
+        try { s.remove(); } catch (_) {}
+    };
+
+    s.onended = cleanup;
+    s.onerror = cleanup;
+    s.play().catch(cleanup);
+}
+
+function stopActiveSoundClones() {
+    activeSoundClones.forEach((s) => {
+        try {
+            s.pause();
+            s.currentTime = 0;
+            s.remove();
+        } catch (_) {}
+    });
+    activeSoundClones.clear();
+}
+
+function getPersistentGameplayAudios() {
+    return [
+        bgmTechniqueDeployment,
+        bgmBossTheme,
+        sfxBreathing
+    ].filter(Boolean);
+}
+
+function stopAllGameplayAudio() {
+    stopBreathingSoundAfterCurrentFile();
+    stopBattleMusic();
+    stopBossMusic();
+    stopActiveSoundClones();
+
+    getPersistentGameplayAudios().forEach((audioFile) => {
+        try {
+            audioFile.pause();
+            audioFile.currentTime = 0;
+        } catch (_) {}
+    });
 }
 
 function startBreathingSound() {
@@ -1199,12 +1857,12 @@ let akazaIntro = {
     compassRadius: 0, compassRedAlpha: 0, compassBlueAlpha: 0, playedReveal: false
 };
 
-const demons = [], projectiles = [], waterTrails = [], foamParticles = [], jumpBursts = [], shockwaves = [], healTexts = [], clashSparks = [], parrySlashes = [];
+const demons = [], projectiles = [], waterTrails = [], foamParticles = [], jumpBursts = [], shockwaves = [], healTexts = [], clashSparks = [], parrySlashes = [], afterglowFistStreaks = [];
 const healthDrops = []; 
 
-const MAX_DEMONS = 11, MAX_PROJECTILES = 400, MAX_WATER_TRAILS = 70, MAX_FOAM = 140, MAX_JUMP_BURSTS = 10, MAX_SHOCKWAVES = 250, MAX_HEAL_TEXTS = 10, MAX_CLASH_SPARKS = 220, MAX_PARRY_SLASHES = 14;
+const MAX_DEMONS = 11, MAX_PROJECTILES = 400, MAX_WATER_TRAILS = 70, MAX_FOAM = 140, MAX_JUMP_BURSTS = 10, MAX_SHOCKWAVES = 250, MAX_HEAL_TEXTS = 10, MAX_CLASH_SPARKS = 220, MAX_PARRY_SLASHES = 14, MAX_AFTERGLOW_FIST_STREAKS = 135;
 const MAX_HEALTH_DROPS = 25;
-const MAX_PROGRESS_SCORE = 100000; // Akaza appears at 70K, which is 70% of the threat path.
+const MAX_PROGRESS_SCORE = 70000; // Arcade threat path ends when Akaza arrives at 70K.
 
 const enemyMilestones = [
     { score: 15000, enemy: "SNIPER DEMON", hp: "1 HP", alert: "ELITE ENEMY UNLOCKED AT 15K SCORE. HP CAP RAISES TO 150.", description: "A ranged demon that keeps distance and fires blood projectiles.", tip: "TIP: Dash in, use forms, or deflect its projectile back.", revealed: false },
@@ -1235,6 +1893,7 @@ function checkEnemyMilestones() {
     }
 }
 function startEnemyRevealPopup(milestone) {
+    resetInputState();
     enemyRevealPopup.active = true;
     enemyRevealPopup.timer = enemyRevealPopup.maxTimer;
     enemyRevealPopup.title = milestone.enemy;
@@ -1317,42 +1976,147 @@ const player = {
     x: 400, y: GROUND_Y - 70, baseY: GROUND_Y - 70, vy: 0, isGrounded: true,
     width: 38, height: 70, speed: 6.5, guardSpeedMultiplier: 0.32, facing: "right", bodyRotation: 0,
     health: 100, maxHealth: 100,
-    breathing: 60, maxBreathing: 150, 
+    breathing: 60, maxBreathing: 180, 
     totalConcentrationActive: false, totalConcentrationTimer: 0, totalConcentrationDuration: 480, totalConcentrationCooldown: 0, totalConcentrationCooldownMax: 1200,
     selectedForm: 0, currentForm: 0, isAttacking: false, attackFrame: 0, maxAttackFrames: 12,
     attackBox: { x: 0, y: 0, width: 90, height: 60 }, hitTargets: new Set(), m1AlreadyHit: false, m1Step: 0,
-    isGuarding: false, guardFrame: 0, perfectParryFrames: 15, guardCooldown: 0,
+    isGuarding: false, guardFrame: 0, perfectParryFrames: 18, guardCooldown: 0,
     isStunned: false, stunTimer: 0, invincibleTimer: 0,
     isDashing: false, dashTimer: 0, dashDir: 1, dashCharges: 2, maxDashCharges: 2, dashRechargeTimer: 0, dashRechargeDelay: 120,
-    jumpSquash: 0, landingSquash: 0
+    jumpSquash: 0, landingSquash: 0, sunSecondHitReset: false, sunImpactLock: false, formParryLock: 0
 };
 
-const formCooldowns = { 1: 0, 2: 0, 3: 0, 4: 0 }; 
-const maxCooldowns = { 1: 240, 2: 360, 3: 900, 4: 1400 }; 
-const attackDamage = { 0: 1, 1: 12, 2: 4, 3: 5, 4: 7 }; // Form 1 / Water Surface Slash buffed because it is a single-hit form.
+const formCooldowns = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 }; 
+const maxCooldowns = { 1: 240, 2: 360, 3: 900, 4: 1400, 5: 3000 }; 
+const formRequirements = { 0: 0, 1: 40, 2: 80, 3: 100, 4: 140, 5: 180 };
+const attackDamage = { 0: 1, 1: 12, 2: 4, 3: 5, 4: 7, 5: 34 }; // Sun Dance is still ultimate, but not boss-melting too fast.
+const sunHealthCost = { 5: 22 };
 resizeCanvas();
+
+function isCutsceneOrPopupActive() {
+    return Boolean((typeof akazaIntro !== "undefined" && akazaIntro.active) || (typeof enemyRevealPopup !== "undefined" && enemyRevealPopup.active));
+}
+
+function isPlayerControlLocked() {
+    return gameState !== "playing" || gameOver || gameWon || player.isStunned || isCutsceneOrPopupActive();
+}
 
 // =====================================================
 // INPUT
 // =====================================================
 window.addEventListener("keydown", (e) => {
-    if (gameState !== "playing" || gameOver || gameWon || player.isStunned) return;
-    if (e.code === "ArrowLeft" || e.code === "KeyA") keys.Left = true; if (e.code === "ArrowRight" || e.code === "KeyD") keys.Right = true; if (e.code === "KeyG") keys.G = true; if (e.code === "ArrowUp" || e.code === "KeyW") keys.W = true;
-    if (e.code === "Space") { keys.Space = true; if (!player.isGuarding && player.guardCooldown <= 0 && !player.isAttacking && !player.isDashing) { player.isGuarding = true; player.guardFrame = 0; } }
-    if (e.code === "KeyQ" && player.dashCharges > 0 && !player.isAttacking && !player.isGuarding && !player.isDashing) { player.isDashing = true; player.dashTimer = 10; player.invincibleTimer = 14; player.dashDir = player.facing === "right" ? 1 : -1; player.dashCharges--; if (player.dashRechargeTimer <= 0) player.dashRechargeTimer = player.dashRechargeDelay; playSound(sfxDash); addFoamBurst(player.x + player.width / 2, player.y + player.height / 2, 12); }
-    if (e.code === "Digit1" && player.breathing >= 40 && formCooldowns[1] <= 0) player.selectedForm = 1; if (e.code === "Digit2" && player.breathing >= 80 && formCooldowns[2] <= 0) player.selectedForm = 2; if (e.code === "Digit3" && player.breathing >= 100 && formCooldowns[3] <= 0) player.selectedForm = 3; if (e.code === "Digit4" && player.breathing >= 140 && formCooldowns[4] <= 0) player.selectedForm = 4;
-    if (e.code === "Digit5" && player.totalConcentrationCooldown <= 0 && !player.totalConcentrationActive && !e.repeat) activateTotalConcentration();
+    if (isPlayerControlLocked()) return;
+
+    if (e.code === "ArrowLeft" || e.code === "KeyA") keys.Left = true;
+    if (e.code === "ArrowRight" || e.code === "KeyD") keys.Right = true;
+    if (e.code === "KeyG") keys.G = true;
+    if (e.code === "ArrowUp" || e.code === "KeyW") keys.W = true;
+
+    if (e.code === "Space") {
+        keys.Space = true;
+        if (!player.isGuarding && player.guardCooldown <= 0 && !player.isAttacking && !player.isDashing) {
+            player.isGuarding = true;
+            player.guardFrame = 0;
+        }
+    }
+
+    if (e.code === "KeyQ" && player.dashCharges > 0 && !player.isAttacking && !player.isGuarding && !player.isDashing) {
+        player.isDashing = true;
+        player.dashTimer = 10;
+        player.invincibleTimer = 14;
+        player.dashDir = player.facing === "right" ? 1 : -1;
+        player.dashCharges--;
+        if (player.dashRechargeTimer <= 0) player.dashRechargeTimer = player.dashRechargeDelay;
+        playSound(sfxDash);
+        addFoamBurst(player.x + player.width / 2, player.y + player.height / 2, 12);
+    }
+
+    if (e.code === "Digit1" && player.breathing >= formRequirements[1] && formCooldowns[1] <= 0) player.selectedForm = 1;
+    if (e.code === "Digit2" && player.breathing >= formRequirements[2] && formCooldowns[2] <= 0) player.selectedForm = 2;
+    if (e.code === "Digit3" && player.breathing >= formRequirements[3] && formCooldowns[3] <= 0) player.selectedForm = 3;
+    if (e.code === "Digit4" && player.breathing >= formRequirements[4] && formCooldowns[4] <= 0) player.selectedForm = 4;
+    if (e.code === "Digit5" && player.breathing >= formRequirements[5] && formCooldowns[5] <= 0) player.selectedForm = 5;
+
+    if (e.code === "KeyF" && player.totalConcentrationCooldown <= 0 && !player.totalConcentrationActive && !e.repeat) activateTotalConcentration();
 });
+
 window.addEventListener("keyup", (e) => {
-    if (e.code === "ArrowLeft" || e.code === "KeyA") keys.Left = false; if (e.code === "ArrowRight" || e.code === "KeyD") keys.Right = false; if (e.code === "KeyG") keys.G = false; if (e.code === "ArrowUp" || e.code === "KeyW") keys.W = false;
-    if (e.code === "Space") { keys.Space = false; if (player.isGuarding) { player.isGuarding = false; player.guardFrame = 0; player.guardCooldown = 18; } }
+    if (e.code === "ArrowLeft" || e.code === "KeyA") keys.Left = false;
+    if (e.code === "ArrowRight" || e.code === "KeyD") keys.Right = false;
+    if (e.code === "KeyG") keys.G = false;
+    if (e.code === "ArrowUp" || e.code === "KeyW") keys.W = false;
+    if (e.code === "Space") {
+        keys.Space = false;
+        if (player.isGuarding) {
+            player.isGuarding = false;
+            player.guardFrame = 0;
+            player.guardCooldown = 18;
+        }
+    }
 });
+
 window.addEventListener("mousedown", (e) => {
-    if (gameState !== "playing" || gameOver || gameWon || player.isStunned || player.isGuarding || player.isDashing || e.button !== 0 || player.isAttacking || keys.G) return;
-    player.isAttacking = true; player.attackFrame = 0; player.currentForm = player.selectedForm; player.hitTargets.clear(); player.m1AlreadyHit = false;
-    if (player.currentForm === 0) { player.m1Step = player.m1Step ? (player.m1Step % 4) + 1 : 1; player.maxAttackFrames = 12; } else { player.m1Step = 0; }
-    if (player.currentForm === 1) { player.maxAttackFrames = 35; player.breathing -= 40; } else if (player.currentForm === 2) { player.maxAttackFrames = 72; player.breathing -= 80; } else if (player.currentForm === 3) { player.maxAttackFrames = 120; player.breathing -= 100; player.isGrounded = false; player.vy = 0; player.jumpSquash = 8; addFoamBurst(player.x + player.width / 2, player.y + player.height, 16); pushJumpBurst(player.x + player.width / 2, player.y + player.height, "jump"); startCameraShake(6, 3.5); } else if (player.currentForm === 4) { player.maxAttackFrames = 130; player.breathing -= 140; }
-    if (player.currentForm > 0) playSound(formSounds[player.currentForm]); else playSound(m1Sounds[player.m1Step - 1]);
+    if (isPlayerControlLocked() || player.isGuarding || player.isDashing || e.button !== 0 || player.isAttacking || keys.G) return;
+
+    const requestedForm = player.selectedForm || 0;
+    if (requestedForm > 0) {
+        const req = formRequirements[requestedForm] || 0;
+        if (player.breathing < req || formCooldowns[requestedForm] > 0) return;
+    }
+
+    player.isAttacking = true;
+    player.attackFrame = 0;
+    player.currentForm = requestedForm;
+    player.hitTargets.clear();
+    player.m1AlreadyHit = false;
+    player.sunSecondHitReset = false;
+    player.sunImpactLock = false;
+    player.formParryLock = 0;
+
+    if (player.currentForm === 0) {
+        player.m1Step = player.m1Step ? (player.m1Step % 4) + 1 : 1;
+        player.maxAttackFrames = 12;
+        playSound(m1Sounds[player.m1Step - 1]);
+    } else {
+        player.m1Step = 0;
+    }
+
+    if (player.currentForm === 1) {
+        player.maxAttackFrames = 35;
+        player.breathing -= 40;
+        playSound(formSounds[1]);
+    } else if (player.currentForm === 2) {
+        player.maxAttackFrames = 72;
+        player.breathing -= 80;
+        playSound(formSounds[2]);
+    } else if (player.currentForm === 3) {
+        player.maxAttackFrames = 120;
+        player.breathing -= 100;
+        player.isGrounded = false;
+        player.vy = 0;
+        player.jumpSquash = 8;
+        addFoamBurst(player.x + player.width / 2, player.y + player.height, 16);
+        pushJumpBurst(player.x + player.width / 2, player.y + player.height, "jump");
+        startCameraShake(6, 3.5);
+        playSound(formSounds[3]);
+    } else if (player.currentForm === 4) {
+        player.maxAttackFrames = 130;
+        player.breathing -= 140;
+        playSound(formSounds[4]);
+    } else if (player.currentForm === 5) {
+        // Sun Breathing 1st Form: SUN DANCE. Ultimate offense + full invulnerability during execution.
+        player.maxAttackFrames = 96;
+        player.breathing -= 180;
+        player.health = Math.max(1, player.health - sunHealthCost[5]);
+        player.invincibleTimer = Math.max(player.invincibleTimer, 42);
+        damageFlashTimer = Math.max(damageFlashTimer, 24);
+        impactFrameTimer = Math.max(impactFrameTimer, 12);
+        lightImpactFrameTimer = Math.max(lightImpactFrameTimer, 8);
+        addSunFlareBurst(player.x + player.width / 2, player.y + player.height / 2, 38);
+        pushStatusText(player.x + player.width / 2, player.y - 30, "SUN BREATHING: SUN DANCE!", "#f97316", 88);
+        startCameraShake(16, 13);
+        playSound(sfxSunDance);
+    }
 });
 
 // =====================================================
@@ -1366,12 +2130,154 @@ function pushWaterTrail(trail) { if (waterTrails.length >= MAX_WATER_TRAILS) wat
 function pushProjectile(projectile) { if (projectiles.length >= MAX_PROJECTILES) projectiles.shift(); projectiles.push(projectile); }
 function pushJumpBurst(x, y, type = "jump") { if (jumpBursts.length >= MAX_JUMP_BURSTS) jumpBursts.shift(); jumpBursts.push({ x, y, radius: type === "land" ? 34 : 24, alpha: 1, type }); }
 function pushShockwave(x, y, maxRadius, damage, owner, color = "#fb923c", speed = 8, lineWidth = 8) { if (shockwaves.length >= MAX_SHOCKWAVES) shockwaves.shift(); shockwaves.push({ x, y, radius: 10, maxRadius, damage, alpha: 1, owner, hasHitPlayer: false, color, speed, lineWidth }); }
-function pushHealText(x, y, amount) { if (healTexts.length >= MAX_HEAL_TEXTS) healTexts.shift(); healTexts.push({ x, y, amount, alpha: 1, vy: -0.6, life: 70 }); }
+function pushHealText(x, y, amount, color = "#22c55e", life = 70) { if (healTexts.length >= MAX_HEAL_TEXTS) healTexts.shift(); healTexts.push({ x, y, amount, alpha: 1, vy: -0.6, life, maxLife: life, color }); }
+function pushStatusText(x, y, text, color = "#38bdf8", life = 70) { pushHealText(x, y, text, color, life); }
+function pushStunText(x, y) { pushStatusText(x, y, "STUNNED!", "#38bdf8", 74); }
 function pushClashSparks(x, y, amount = 20, color = "#fb923c") { for (let i = 0; i < amount; i++) { if (clashSparks.length >= MAX_CLASH_SPARKS) clashSparks.shift(); const angle = Math.random() * Math.PI * 2; const speed = Math.random() * 6 + 3; clashSparks.push({ x, y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed, length: Math.random() * 18 + 8, alpha: 1, color }); } }
 function pushParrySlash(x, y) { if (parrySlashes.length >= MAX_PARRY_SLASHES) parrySlashes.shift(); parrySlashes.push({ x, y, alpha: 1, radius: 35, rotation: Math.random() * Math.PI }); parrySlashes.push({ x, y, alpha: 1, radius: 26, rotation: Math.random() * Math.PI }); }
-function addFoamBurst(worldX, worldY, amount = 12) { for (let i = 0; i < amount; i++) { if (foamParticles.length >= MAX_FOAM) foamParticles.shift(); foamParticles.push({ x: worldX, y: worldY, vx: (Math.random() - 0.5) * 10, vy: (Math.random() - 0.5) * 10, radius: Math.random() * 6 + 2, alpha: 1, decay: Math.random() * 0.035 + 0.025 }); } }
+function pushAfterglowFistStreak(x, y, angle, length = 130, color = "#e0f2fe") {
+    if (afterglowFistStreaks.length >= MAX_AFTERGLOW_FIST_STREAKS) afterglowFistStreaks.shift();
+    afterglowFistStreaks.push({
+        x,
+        y,
+        angle,
+        length,
+        alpha: 1,
+        width: 22 + Math.random() * 24,
+        color,
+        curl: (Math.random() - 0.5) * 34,
+        pulse: Math.random() * Math.PI * 2
+    });
+}
+function addFoamBurst(worldX, worldY, amount = 12) { for (let i = 0; i < amount; i++) { if (foamParticles.length >= MAX_FOAM) foamParticles.shift(); foamParticles.push({ x: worldX, y: worldY, vx: (Math.random() - 0.5) * 10, vy: (Math.random() - 0.5) * 10, radius: Math.random() * 6 + 2, alpha: 1, decay: Math.random() * 0.035 + 0.025, color: "#dbeafe", shadow: "#38bdf8" }); } }
+function addSunFlareBurst(worldX, worldY, amount = 24) { for (let i = 0; i < amount; i++) { if (foamParticles.length >= MAX_FOAM) foamParticles.shift(); const angle = Math.random() * Math.PI * 2; const speed = Math.random() * 16 + 5; const ember = Math.random(); foamParticles.push({ x: worldX, y: worldY, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed - Math.random() * 2.5, radius: Math.random() * 10 + 4, alpha: 1, decay: Math.random() * 0.026 + 0.012, color: ember < 0.25 ? "#fff7ad" : ember < 0.58 ? "#fbbf24" : ember < 0.84 ? "#f97316" : "#ef4444", shadow: ember < 0.7 ? "#f97316" : "#991b1b" }); } }
 function startCameraShake(duration, strength) { shakeTimer = duration; shakeStrength = strength; }
 function isPerfectParryWindow() { return player.isGuarding && player.guardFrame <= player.perfectParryFrames; }
+function isSunDanceActive() {
+    return player.isAttacking && player.currentForm === 5 && player.attackFrame > 0 && player.attackFrame < player.maxAttackFrames - 1;
+}
+
+function isWaterDefenseFormActive() {
+    // Water 1 and 2 are damage-only. Water 3 and 4 are the defensive forms.
+    return player.isAttacking && (player.currentForm === 3 || player.currentForm === 4) && player.attackFrame > 3 && player.attackFrame < player.maxAttackFrames - 2;
+}
+
+function isWaterWheelProjectileDeflectActive() {
+    // Water Wheel can cut/deflect projectiles only. It does NOT block physical contact attacks.
+    return player.isAttacking && player.currentForm === 2 && player.attackFrame > 4 && player.attackFrame < player.maxAttackFrames - 2;
+}
+
+function getWaterWheelDeflectBox() {
+    const padding = 34;
+    return {
+        x: player.attackBox.x - padding,
+        y: player.attackBox.y - padding,
+        width: player.attackBox.width + padding * 2,
+        height: player.attackBox.height + padding * 2
+    };
+}
+
+function deflectProjectileWithWaterWheel(pr) {
+    const dir = player.facing === "right" ? 1 : -1;
+    pr.vx = Math.max(16, Math.abs(pr.vx || 16)) * dir * 1.65;
+    pr.vy = (Math.random() - 0.5) * 4;
+    pr.color = "#38bdf8";
+    pr.deflected = true;
+    combo++;
+    comboTimer = 230;
+    score += 160;
+    playSound(sfxParryClang);
+    addFoamBurst(pr.x, pr.y, 12);
+    pushClashSparks(pr.x, pr.y, 24, "#38bdf8");
+    pushClashSparks(pr.x, pr.y, 10, "#ffffff");
+    pushParrySlash(pr.x, pr.y);
+    startCameraShake(7, 5);
+}
+
+function isFormDefenseActive() {
+    return isWaterDefenseFormActive() || isSunDanceActive();
+}
+
+function isFormParryActive() {
+    // True parry/clash belongs to Sun Dance only. Water 3/4 defend, but they do not become Sun-level parries.
+    return isSunDanceActive();
+}
+
+function getActiveFormDefenseBox() {
+    if (!isFormDefenseActive()) return getPlayerBox();
+    const padding = player.currentForm === 5 ? 68 : 44;
+    return {
+        x: player.attackBox.x - padding,
+        y: player.attackBox.y - padding,
+        width: player.attackBox.width + padding * 2,
+        height: player.attackBox.height + padding * 2
+    };
+}
+
+function getActiveFormParryBox() {
+    return getActiveFormDefenseBox();
+}
+
+function doFormDefense(targetObject = null, x = null, y = null) {
+    if (isSunDanceActive()) return doFormParry(targetObject, x, y);
+    if (!isWaterDefenseFormActive()) return false;
+
+    const px = x ?? (player.x + player.width / 2);
+    const py = y ?? (player.y + player.height / 2);
+    if (player.formParryLock > 0) return true;
+
+    player.formParryLock = 7;
+    player.invincibleTimer = Math.max(player.invincibleTimer, 10);
+    comboTimer = 220;
+    score += 55;
+    playSound(sfxClash);
+    pushClashSparks(px, py, 34, "#38bdf8");
+    pushClashSparks(px, py, 12, "#ffffff");
+    pushParrySlash(px, py);
+    addFoamBurst(px, py, 10);
+    startCameraShake(8, 6);
+
+    if (targetObject) {
+        targetObject.attackWindup = 0;
+        targetObject.attackHasHit = true;
+        if (targetObject !== akaza) targetObject.attackCooldown = Math.max(targetObject.attackCooldown || 0, 35);
+        if (targetObject === akaza && targetObject.currentAttack !== "chaotic_afterglow") {
+            targetObject.attackDuration = Math.min(targetObject.attackDuration || 0, 26);
+        }
+    }
+    return true;
+}
+
+function doFormParry(targetObject = null, x = null, y = null) {
+    if (!isSunDanceActive()) return false;
+
+    const px = x ?? (player.x + player.width / 2);
+    const py = y ?? (player.y + player.height / 2);
+    if (player.formParryLock > 0) return true;
+
+    player.formParryLock = 6;
+    player.invincibleTimer = Math.max(player.invincibleTimer, 18);
+    combo += 2;
+    comboTimer = 240;
+    score += 140;
+    playSound(sfxParryClang);
+    pushClashSparks(px, py, 54, "#fbbf24");
+    pushClashSparks(px, py, 28, "#ffffff");
+    pushParrySlash(px, py);
+    startCameraShake(13, 10);
+    addSunFlareBurst(px, py, 12);
+
+    if (targetObject) {
+        targetObject.stunnedTimer = Math.max(targetObject.stunnedTimer || 0, 54);
+        targetObject.attackWindup = 0;
+        targetObject.attackHasHit = true;
+        if (targetObject === akaza && targetObject.currentAttack !== "chaotic_afterglow") {
+            targetObject.attackDuration = Math.min(targetObject.attackDuration || 0, 18);
+            pushStunText(targetObject.x + targetObject.width / 2, targetObject.y - 22);
+        }
+    }
+    return true;
+}
 
 // --- EXPLOSIVE EXPANDING BOSS SMOKE SYSTEM ---
 function createBossSmoke(x, y, amount) {
@@ -1431,29 +2337,103 @@ function drawHealthDrops() {
     });
 }
 
-function handlePlayerDamage(amount) {
-    if (player.invincibleTimer > 0) return;
+function freezeRunAfterEnd() {
+    stopAllGameplayAudio();
+    cancelPlayerActionState({ resetCooldowns: false, clearTrails: true });
+
+    demons.length = 0;
+    projectiles.length = 0;
+    shockwaves.length = 0;
+    afterglowFistStreaks.length = 0;
+    bossSmoke.length = 0;
+    clashSparks.length = 0;
+    parrySlashes.length = 0;
+
+    if (akaza) {
+        akaza.state = "ended";
+        akaza.currentAttack = null;
+        akaza.attackWindup = 0;
+        akaza.attackDuration = 0;
+        akaza.comboStep = 0;
+        akaza.afterglowCloseHitTimer = 0;
+    }
+
+    if (akazaIntro) {
+        akazaIntro.active = false;
+        akazaIntro.dialogue = null;
+        akazaIntro.smoke = [];
+        akazaIntro.shockRings = [];
+    }
+
+    enemyRevealPopup.active = false;
+    enemyRevealPopup.timer = 0;
+    timeScale = 0;
+}
+
+function scheduleResultScreen(delay = 900) {
+    const resultSessionId = gameplaySessionId;
+    const resultToken = ++resultScreenToken;
+
+    setTimeout(() => {
+        if (gameplaySessionId !== resultSessionId) return;
+        if (resultToken !== resultScreenToken) return;
+        if (gameState !== "playing") return;
+        if (!(gameOver || gameWon) || endScreenShown) return;
+        showResultScreen();
+    }, delay);
+}
+
+function handlePlayerDamage(amount, options = {}) {
+    if (gameOver || gameWon || endScreenShown) return;
+
+    const ignoreFormDefense = Boolean(options.ignoreFormDefense);
+    const ignoreGuard = Boolean(options.ignoreGuard);
+    const ignoreInvincibility = Boolean(options.ignoreInvincibility);
+    const invincibleFrames = Number.isFinite(options.invincibleFrames) ? options.invincibleFrames : (player.isGuarding && !ignoreGuard ? 18 : 32);
+
+    if (!ignoreFormDefense && isFormDefenseActive()) { doFormDefense(null); return; }
+    if (!ignoreInvincibility && player.invincibleTimer > 0) return;
+
     let finalDamage = amount;
-    if (player.isGuarding) { finalDamage *= 0.35; addFoamBurst(player.x + player.width / 2, player.y + player.height / 2, 6); }
-    player.health -= finalDamage; combo = 0; comboTimer = 0; player.invincibleTimer = player.isGuarding ? 18 : 32;
-    if (player.isGuarding) { playSound(sfxGuardDamage); playSound(sfxClash); pushClashSparks(player.x + player.width / 2, player.y + player.height / 2, 24, "#fb923c"); pushClashSparks(player.x + player.width / 2, player.y + player.height / 2, 10, "#ffffff"); } else { playSound(sfxPlayerHurt); }
+    if (player.isGuarding && !ignoreGuard) {
+        finalDamage *= 0.35;
+        addFoamBurst(player.x + player.width / 2, player.y + player.height / 2, 6);
+    }
+
+    player.health -= finalDamage;
+    combo = 0;
+    comboTimer = 0;
+    player.invincibleTimer = Math.max(player.invincibleTimer, invincibleFrames);
+
+    if (player.isGuarding && !ignoreGuard) {
+        playSound(sfxGuardDamage);
+        playSound(sfxClash);
+        pushClashSparks(player.x + player.width / 2, player.y + player.height / 2, 24, "#fb923c");
+        pushClashSparks(player.x + player.width / 2, player.y + player.height / 2, 10, "#ffffff");
+    } else {
+        playSound(sfxPlayerHurt);
+        if (player.isGuarding && ignoreGuard) {
+            pushStatusText(player.x + player.width / 2, player.y - 18, "GUARD BROKEN!", "#f43f5e", 46);
+            pushClashSparks(player.x + player.width / 2, player.y + player.height / 2, 36, "#e0f2fe");
+        }
+    }
     
-    // Increased Camera Shake on Damage
-    startCameraShake(player.isGuarding ? 8 : 18, player.isGuarding ? 5 : 15);
-    
-    if (!player.isGuarding) damageFlashTimer = 15;
+    startCameraShake(ignoreGuard ? 22 : (player.isGuarding ? 8 : 18), ignoreGuard ? 16 : (player.isGuarding ? 5 : 15));
+    damageFlashTimer = Math.max(damageFlashTimer, ignoreGuard ? 22 : (!player.isGuarding ? 15 : 0));
     
     if (player.health <= 0) { 
         player.health = 0; 
         gameOver = true; 
+        gameWon = false;
         endSequenceTimer = 0;
-        timeScale = 0.2; 
-        playSound(sfxPlayerHurt);
+        endMusicStopped = false;
+        freezeRunAfterEnd();
+        scheduleResultScreen(650);
     }
 }
 
 function doPerfectParry(targetObject, isProjectile = false) {
-    player.invincibleTimer = 35; player.guardCooldown = 0; combo += 6; comboTimer = 260; score += 1200;
+    player.invincibleTimer = 30; player.guardCooldown = 0; combo += 5; comboTimer = 250; score += 650;
     
     // Universal Parry Buff! Physical and Projectile both give 8 HP.
     // Parry intentionally does NOT restore breathing.
@@ -1463,20 +2443,22 @@ function doPerfectParry(targetObject, isProjectile = false) {
 
     if (targetObject) targetObject.stunnedTimer = 130;
     const px = player.x + player.width / 2; const py = player.y + player.height / 2;
-    addFoamBurst(px, py, 28); pushClashSparks(px, py, 100, "#f97316"); pushClashSparks(px, py, 75, "#ffffff"); pushClashSparks(px, py, 55, "#38bdf8"); pushParrySlash(px, py); stunNearbyEnemies(px, py, 150); startCameraShake(14, 10); playSound(sfxParryClang); playSound(sfxPerfectParry);
+    addFoamBurst(px, py, 22); pushClashSparks(px, py, 70, "#f97316"); pushClashSparks(px, py, 50, "#ffffff"); pushClashSparks(px, py, 38, "#38bdf8"); pushParrySlash(px, py); stunNearbyEnemies(px, py, 125); startCameraShake(11, 8); playSound(sfxParryClang); playSound(sfxPerfectParry);
     return true;
 }
 
 function stunNearbyEnemies(x, y, radius) {
     if (akaza) { 
         if (akaza.currentAttack !== "chaotic_afterglow") {
-            akaza.stunnedTimer = 40; akaza.attackWindup = 0; akaza.currentAttack = null; 
+            akaza.stunnedTimer = Math.max(akaza.stunnedTimer, 55); akaza.attackWindup = 0; akaza.currentAttack = null; 
+            pushStunText(akaza.x + akaza.width / 2, akaza.y - 18);
         }
     }
-    demons.forEach((d) => { const dx = d.x + d.width / 2 - x; const dy = d.y + d.height / 2 - y; const dist = Math.sqrt(dx * dx + dy * dy); if (dist <= radius) { d.stunnedTimer = Math.max(d.stunnedTimer, 70); d.health -= 0.5; } });
+    demons.forEach((d) => { const dx = d.x + d.width / 2 - x; const dy = d.y + d.height / 2 - y; const dist = Math.sqrt(dx * dx + dy * dy); if (dist <= radius) { d.stunnedTimer = Math.max(d.stunnedTimer, 65); d.health -= 0.35; pushStunText(d.x + d.width / 2, d.y - 18); } });
 }
 
 function handleGuardOrParryAgainstPhysical(targetObject, damageAmount) {
+    if (isFormDefenseActive()) { doFormDefense(targetObject); return; }
     if (!player.isGuarding) { handlePlayerDamage(damageAmount); return; }
     if (isPerfectParryWindow()) { doPerfectParry(targetObject, false); return; }
     handlePlayerDamage(damageAmount);
@@ -1515,7 +2497,8 @@ function startAkazaIntro() {
     combo = 0; comboTimer = 0; spawnTimer = 0;
     
     // Keep player grounded but DON'T forcibly teleport them in Arcade to fix the camera jitter!
-    player.y = player.baseY; player.vy = 0; player.isGrounded = true; player.isAttacking = false; player.isGuarding = false; player.isDashing = false; player.isStunned = false; player.facing = "right";
+    cancelPlayerActionState({ resetCooldowns: false, clearTrails: true });
+    player.y = player.baseY; player.vy = 0; player.isGrounded = true; player.facing = "right";
 
     // Dynamically calculate spawn X so he drops relative to the player's current location smoothly
     let spawnDir = player.x < MAP_WIDTH / 2 ? 1 : -1;
@@ -1523,11 +2506,11 @@ function startAkazaIntro() {
     
     akaza = {
         x: spawnX, y: -220, targetY: GROUND_Y - 95, width: 60, height: 95, vy: 30, pose: "falling", facing: "left", bodyRotation: 0,
-        health: 1800, maxHealth: 1800, state: "idle", actionTimer: 60,
+        health: 2400, maxHealth: 2400, state: "idle", actionTimer: 60,
         attackWindup: 0, currentAttack: null, attackDuration: 0,
         comboStep: 0, dodgeCooldown: 0, invulnerable: false,
         stunnedTimer: 0, flashRed: 0, dashTargetX: 0,
-        compassFadeAlpha: 0.85, damageScale: 1, chaoticUses: 0 
+        compassFadeAlpha: 0.85, damageScale: 1, chaoticUses: 0, chaoticThresholdTriggered: false 
     };
 
     akazaIntro = { active: true, done: false, timer: 0, phase: 1, letterbox: 0, smoke: [], shockRings: [], smokeAlpha: 1, landed: false, standingProgress: 0, cameraFocusX: player.x + player.width / 2, zoomTarget: 1, currentZoom: 1, dialogue: null, compassRadius: 0, compassRedAlpha: 0, compassBlueAlpha: 0, playedReveal: false };
@@ -1629,6 +2612,18 @@ function updateAkazaBoss(realDt) {
 
     const bossDt = realDt * enrageMult;
 
+    // Chaotic Afterglow can randomly start once Akaza is around 45% HP,
+    // but if he reaches 35% HP it is guaranteed so the final form never gets skipped.
+    if (hpPct <= 0.35 && akaza.chaoticUses < 1 && akaza.state !== "attacking") {
+        akaza.chaoticThresholdTriggered = true;
+        akaza.stunnedTimer = 0;
+        akaza.invulnerable = false;
+        akaza.actionTimer = 0;
+        pushStatusText(akaza.x + akaza.width / 2, akaza.y - 34, "FINAL FORM!", "#f43f5e", 120);
+        startAkazaAttack("chaotic_afterglow");
+        return;
+    }
+
     if (akaza.compassFadeAlpha > 0) akaza.compassFadeAlpha = Math.max(0, akaza.compassFadeAlpha - 0.015 * bossDt);
     if (akaza.flashRed > 0) akaza.flashRed -= bossDt;
     if (akaza.stunnedTimer > 0) { akaza.stunnedTimer -= bossDt; return; }
@@ -1664,9 +2659,11 @@ function updateAkazaBoss(realDt) {
 
         if (akaza.actionTimer <= 0) {
             const rand = Math.random();
-            const tryChaotic = (akaza.chaoticUses < 1 && hpPct <= 0.4 && rand < 0.08);
+            const tryChaotic = akaza.chaoticUses < 1 && hpPct <= 0.45 && hpPct > 0.35 && rand < 0.30;
 
             if (tryChaotic) {
+                akaza.chaoticThresholdTriggered = true;
+                pushStatusText(akaza.x + akaza.width / 2, akaza.y - 34, "FINAL FORM!", "#f43f5e", 120);
                 startAkazaAttack("chaotic_afterglow");
             } else {
                 if (dist > 400) {
@@ -1702,7 +2699,7 @@ function startAkazaAttack(attackName) {
         case "air_type": 
             akaza.attackWindup = 20; akaza.attackDuration = 80; akaza.flashRed = 20; playSound(sfxSwiftDash); break;
         case "leg_type": 
-            akaza.attackWindup = 25; akaza.attackDuration = 40; akaza.flashRed = 25; playSound(sfxLegType); break;
+            akaza.attackWindup = 34; akaza.attackDuration = 58; akaza.flashRed = 28; playSound(sfxLegType); break;
         case "disorder": 
             akaza.attackWindup = 15; akaza.attackDuration = 50; akaza.flashRed = 15; playSound(sfxDisorder); break; 
         case "rush": 
@@ -1715,13 +2712,20 @@ function startAkazaAttack(attackName) {
             akaza.attackWindup = 20; akaza.attackDuration = 100; akaza.flashRed = 20; playSound(sfxBigLeap); break;
         case "chaotic_afterglow": 
             akaza.chaoticUses++; 
-            akaza.attackWindup = 105;
-            akaza.attackDuration = 1410; // Exactly 12 seconds
-            akaza.flashRed = 45;
-            impactFrameTimer = 55; 
-            startCameraShake(80, 30);
+            akaza.attackWindup = 100;
+            akaza.attackDuration = 1180; // Final form barrage, still long but capped for performance
+            akaza.flashRed = 60;
+            akaza.comboStep = 0;
+            akaza.afterglowCloseHitTimer = 0;
+            impactFrameTimer = 72; 
+            lightImpactFrameTimer = Math.max(lightImpactFrameTimer, 30);
+            startCameraShake(115, 42);
             playSound(sfxBruteSlam); 
             createBossSmoke(akaza.x + akaza.width/2, akaza.y + akaza.height, 220); 
+            // Huge dramatic stomp shockwave: warning first, lethal pulse second.
+            pushShockwave(akaza.x + akaza.width / 2, akaza.y + akaza.height - 4, 2050, 0, akaza, "#ffffff", 70, 18);
+            pushShockwave(akaza.x + akaza.width / 2, akaza.y + akaza.height - 4, 1900, 28 * akaza.damageScale, akaza, "#38bdf8", 54, 34);
+            pushStatusText(akaza.x + akaza.width / 2, akaza.y - 46, "CHAOTIC AFTERGLOW! GET AWAY!", "#e0f2fe", 135);
             break;
     }
 }
@@ -1745,7 +2749,7 @@ function processAkazaAttack(dt, realDt, dist, dir) {
             akaza.y = akaza.targetY - 140 + Math.sin(akaza.attackDuration * 0.2) * 10;
             if (Math.floor(akaza.attackDuration) % 15 <= 1 && akaza.comboStep < 5) {
                 akaza.comboStep++; playSound(sfxAirType);
-                pushShockwave(akaza.x + akaza.width/2 + (dir*20), akaza.y + 40, 50, 0, akaza, "#38bdf8", 12, 3);
+                pushShockwave(akaza.x + akaza.width/2 + (dir*20), akaza.y + 40, 58, 0, akaza, "#38bdf8", 12, 3); pushClashSparks(akaza.x + akaza.width/2 + dir * 24, akaza.y + 34, 8, "#38bdf8");
                 const angle = Math.atan2((player.y + player.height/2) - (akaza.y + 20), (player.x + player.width/2) - (akaza.x + akaza.width/2));
                 const vSpeed = 18;
                 pushProjectile({ x: akaza.x + akaza.width / 2, y: akaza.y + 20 + Math.random()*20, vx: Math.cos(angle)*vSpeed, vy: Math.sin(angle)*vSpeed, radius: 14, coreRadius: 8, color: "#38bdf8", damage: 2 * akaza.damageScale, deflected: false });
@@ -1756,8 +2760,11 @@ function processAkazaAttack(dt, realDt, dist, dir) {
             if (akaza.comboStep === 0) {
                 akaza.comboStep = 1; 
                 playSound(sfxLegType); playSound(sfxSwiftDash);
-                pushShockwave(akaza.x + akaza.width/2, akaza.y + akaza.height, 160, 4 * akaza.damageScale, akaza, "#0ea5e9", 16, 5);
-                pushProjectile({ x: akaza.x + akaza.width / 2, y: akaza.y + akaza.height - 10, vx: dir * 65, vy: 0, radius: 25, coreRadius: 12, color: "#0ea5e9", damage: 6 * akaza.damageScale, deflected: false });
+                pushShockwave(akaza.x + akaza.width/2, akaza.y + akaza.height, 185, 4 * akaza.damageScale, akaza, "#0ea5e9", 14, 6);
+                pushShockwave(akaza.x + akaza.width/2 + dir * 38, akaza.y + akaza.height - 18, 115, 0, akaza, "#38bdf8", 18, 4);
+                pushProjectile({ x: akaza.x + akaza.width / 2, y: akaza.y + akaza.height - 10, vx: dir * 48, vy: 0, radius: 24, coreRadius: 12, color: "#0ea5e9", damage: 5.5 * akaza.damageScale, deflected: false });
+                pushClashSparks(akaza.x + akaza.width/2 + dir * 70, akaza.y + akaza.height - 22, 22, "#38bdf8");
+                pushParrySlash(akaza.x + akaza.width/2 + dir * 86, akaza.y + akaza.height - 42);
                 startCameraShake(10, 6);
             } break;
             
@@ -1766,26 +2773,28 @@ function processAkazaAttack(dt, realDt, dist, dir) {
                 const hx = akaza.x + (dir === 1 ? akaza.width : -120);
                 pushClashSparks(hx + Math.random()*120, akaza.y + Math.random()*akaza.height, 5, "#38bdf8");
                 pushShockwave(hx + Math.random()*40, akaza.y + 20 + Math.random()*60, 45, 0, akaza, "#38bdf8", 14, 2);
-                if (rectsOverlap({x: hx, y: akaza.y, width: 120, height: akaza.height}, getPlayerBox())) handleGuardOrParryAgainstPhysical(akaza, 1.5 * akaza.damageScale); 
+                if (rectsOverlap({x: hx, y: akaza.y, width: 120, height: akaza.height}, getPlayerBox()) || (isFormDefenseActive() && rectsOverlap({x: hx, y: akaza.y, width: 120, height: akaza.height}, getActiveFormParryBox()))) handleGuardOrParryAgainstPhysical(akaza, 1.5 * akaza.damageScale); 
                 playSound(sfxDisorder);
             } break;
             
         case "rush": 
-            akaza.x += dir * 9 * dt;
+            akaza.x += dir * 8.5 * dt;
+            if (Math.floor(akaza.attackDuration) % 10 <= 1) pushShockwave(akaza.x + akaza.width/2, akaza.y + akaza.height - 6, 42, 0, akaza, "#e0f2fe", 14, 2);
             if (Math.floor(akaza.attackDuration) % 20 <= 1 && akaza.comboStep < 3) {
                 akaza.comboStep++; playSound(sfxRush);
                 pushShockwave(akaza.x + akaza.width/2, akaza.y + 40, 70, 0, akaza, "#ffffff", 12, 3);
-                if (dist < 80) handleGuardOrParryAgainstPhysical(akaza, 4 * akaza.damageScale); 
+                if (dist < 80 || (isFormDefenseActive() && rectsOverlap(getActiveFormParryBox(), { x: akaza.x - 90, y: akaza.y, width: akaza.width + 180, height: akaza.height }))) handleGuardOrParryAgainstPhysical(akaza, 4 * akaza.damageScale); 
                 pushClashSparks(akaza.x + (dir===1?akaza.width:0), akaza.y + 40, 10, "#ffffff");
             } break;
 
         case "eight_layered": 
-            akaza.x += dir * 5 * dt; 
+            akaza.x += dir * 4.8 * dt; 
+            if (Math.floor(akaza.attackDuration) % 12 <= 1) pushShockwave(akaza.x + akaza.width/2, akaza.y + akaza.height/2, 44, 0, akaza, "#38bdf8", 12, 2);
             if (Math.floor(akaza.attackDuration) % 6 <= 1 && akaza.comboStep < 8) {
                 akaza.comboStep++; playSound(sfxEightLayered);
                 const hx = akaza.x + (dir === 1 ? akaza.width : -80);
                 pushShockwave(hx + Math.random()*40, akaza.y + Math.random()*akaza.height, 65, 0, akaza, "#38bdf8", 12, 4);
-                if (rectsOverlap({x: hx, y: akaza.y, width: 80, height: akaza.height}, getPlayerBox())) handleGuardOrParryAgainstPhysical(akaza, 2 * akaza.damageScale); 
+                if (rectsOverlap({x: hx, y: akaza.y, width: 80, height: akaza.height}, getPlayerBox()) || (isFormDefenseActive() && rectsOverlap({x: hx, y: akaza.y, width: 80, height: akaza.height}, getActiveFormParryBox()))) handleGuardOrParryAgainstPhysical(akaza, 2 * akaza.damageScale); 
                 pushClashSparks(akaza.x + (dir===1?akaza.width:0), akaza.y + Math.random()*akaza.height, 12, "#38bdf8");
                 startCameraShake(4, 3); 
             } break;
@@ -1793,7 +2802,7 @@ function processAkazaAttack(dt, realDt, dist, dir) {
         case "annihilation": 
             akaza.x += (akaza.dashTargetX - akaza.x) * 0.3 * dt;
             pushJumpBurst(akaza.x + akaza.width/2, akaza.y + akaza.height/2, "jump");
-            if (akaza.attackDuration > 10 && dist < 70 && akaza.comboStep === 0) {
+            if (akaza.attackDuration > 10 && (dist < 70 || (isFormDefenseActive() && rectsOverlap(getActiveFormParryBox(), { x: akaza.x - 110, y: akaza.y, width: akaza.width + 220, height: akaza.height }))) && akaza.comboStep === 0) {
                 akaza.comboStep = 1; 
                 handleGuardOrParryAgainstPhysical(akaza, 25 * akaza.damageScale); 
                 impactFrameTimer = 12; 
@@ -1821,30 +2830,88 @@ function processAkazaAttack(dt, realDt, dist, dir) {
         case "chaotic_afterglow": 
             if (akaza.comboStep === 0) {
                 akaza.comboStep = 1;
-                playSound(sfxChaoticAfterglow); 
+                playSound(sfxChaoticAfterglow);
+                impactFrameTimer = Math.max(impactFrameTimer, 28);
+                lightImpactFrameTimer = Math.max(lightImpactFrameTimer, 14);
+                startCameraShake(42, 26);
+                const burstCX = akaza.x + akaza.width / 2;
+                const burstCY = akaza.y + akaza.height / 2;
+                for (let j = 0; j < 16; j++) {
+                    const a = (Math.PI * 2 * j) / 16 + (Math.random() - 0.5) * 0.16;
+                    pushAfterglowFistStreak(burstCX + Math.cos(a) * 18, burstCY + Math.sin(a) * 18, a, 190 + Math.random() * 110, j % 3 === 0 ? "#ffffff" : "#38bdf8");
+                }
             }
+
+            // Close-range punishment: guarding should not let the player hug Akaza and auto-block everything.
+            // These are physical punch shockwaves around his body, so they still chip hard through guard.
+            akaza.afterglowCloseHitTimer = Math.max(0, (akaza.afterglowCloseHitTimer || 0) - realDt);
+            const centerX = akaza.x + akaza.width / 2;
+            const centerY = akaza.y + akaza.height / 2;
+            const playerCX = player.x + player.width / 2;
+            const playerCY = player.y + player.height / 2;
+            const closeDist = distanceBetween(centerX, centerY, playerCX, playerCY);
+            const afterglowDangerRadius = 520;
+            if (closeDist < afterglowDangerRadius && akaza.afterglowCloseHitTimer <= 0) {
+                akaza.afterglowCloseHitTimer = 15;
+                const punchAngle = Math.atan2(playerCY - centerY, playerCX - centerX);
+                for (let j = 0; j < 14; j++) {
+                    const a = punchAngle + (Math.random() - 0.5) * 1.85;
+                    const sx = centerX + Math.cos(a) * (38 + Math.random() * 105);
+                    const sy = centerY + Math.sin(a) * (22 + Math.random() * 64);
+                    const punchColor = Math.random() < 0.48 ? "#ffffff" : Math.random() < 0.76 ? "#e0f2fe" : "#38bdf8";
+                    pushAfterglowFistStreak(sx, sy, a, 245 + Math.random() * 175, punchColor);
+                    if (j < 7) {
+                        pushShockwave(sx + Math.cos(a) * 72, sy + Math.sin(a) * 26, 210 + Math.random() * 120, 0, akaza, punchColor, 30, 13);
+                    }
+                }
+                pushClashSparks(playerCX, playerCY, 42, "#e0f2fe");
+                pushStatusText(playerCX, playerCY - 42, "GET OUT OF RANGE!", "#f43f5e", 44);
+                handlePlayerDamage(38 * akaza.damageScale, { ignoreGuard: true, ignoreFormDefense: true, ignoreInvincibility: true, invincibleFrames: 4 });
+                startCameraShake(24, 18);
+            }
+
             if (Math.floor(akaza.attackDuration) % 5 <= 1) { 
-                for (let i = 0; i < 4; i++) {
-                    const randX = akaza.x + (Math.random() - 0.5) * 1600;
-                    const randY = Math.max(GROUND_Y - 500, akaza.y - Math.random() * 600 + 50);
-                    pushShockwave(randX, randY, Math.random() * 150 + 150, 20 * akaza.damageScale, akaza, "#e0f2fe", Math.random() * 15 + 25, 8);
-                    
-                    const angle = Math.random() * Math.PI * 2;
-                    const vSpeed = Math.random() * 20 + 25;
+                const shots = akaza.attackDuration > 820 ? 5 : 4;
+                for (let extra = 0; extra < 3; extra++) {
+                    const a = Math.random() * Math.PI * 2;
+                    pushAfterglowFistStreak(centerX + Math.cos(a) * 28, centerY + Math.sin(a) * 18, a, 170 + Math.random() * 120, Math.random() < 0.45 ? "#ffffff" : "#38bdf8");
+                }
+                for (let i = 0; i < shots; i++) {
+                    const side = Math.random() < 0.5 ? -1 : 1;
+                    const fistX = centerX + side * (24 + Math.random() * 42);
+                    const fistY = centerY - 18 + (Math.random() - 0.5) * 72;
+                    let angle;
+                    if (Math.random() < 0.7) {
+                        // Bias left/right so it spreads across the stage instead of mostly up/down.
+                        angle = (side < 0 ? Math.PI : 0) + (Math.random() - 0.5) * 0.9;
+                    } else {
+                        angle = Math.atan2(playerCY - fistY, playerCX - fistX) + (Math.random() - 0.5) * 0.75;
+                    }
+                    const vSpeed = Math.random() * 14 + 27;
+                    const color = Math.random() < 0.34 ? "#ffffff" : Math.random() < 0.72 ? "#e0f2fe" : "#38bdf8";
+                    pushAfterglowFistStreak(fistX, fistY, angle, 190 + Math.random() * 150, color);
                     pushProjectile({ 
-                        x: akaza.x + akaza.width/2 + (Math.random()-0.5)*350, 
-                        y: akaza.y + (Math.random()-0.5)*350, 
+                        x: fistX + Math.cos(angle) * 24, 
+                        y: fistY + Math.sin(angle) * 12, 
                         vx: Math.cos(angle) * vSpeed, 
                         vy: Math.sin(angle) * vSpeed, 
-                        radius: Math.random() * 20 + 20, 
-                        coreRadius: 12, 
-                        color: "#ffffff", 
-                        damage: 18 * akaza.damageScale, 
-                        deflected: false 
-                    }); 
+                        radius: Math.random() * 13 + 22, 
+                        coreRadius: 10, 
+                        color, 
+                        damage: 25 * akaza.damageScale, 
+                        deflected: false,
+                        style: "chaotic",
+                        duration: 112
+                    });
+
+                    if (i < 2) {
+                        const waveX = fistX + Math.cos(angle) * (70 + Math.random() * 80);
+                        const waveY = fistY + Math.sin(angle) * (30 + Math.random() * 30);
+                        pushShockwave(waveX, waveY, Math.random() * 115 + 140, 0, akaza, color, Math.random() * 10 + 22, 8);
+                    }
                 }
-                pushClashSparks(akaza.x + akaza.width/2 + (Math.random()-0.5)*200, akaza.y + (Math.random()-0.5)*200, 20, "#38bdf8");
-                startCameraShake(12, 10); 
+                pushClashSparks(centerX + (Math.random() - 0.5) * 210, centerY + (Math.random() - 0.5) * 130, 18, Math.random() < 0.5 ? "#38bdf8" : "#ffffff");
+                startCameraShake(8, 6.5); 
             } break;
     }
 
@@ -1856,6 +2923,29 @@ function processAkazaAttack(dt, realDt, dist, dir) {
     }
 }
 
+
+function finishAkazaVictory(source = "player") {
+    if (gameWon || gameOver || !akaza) return;
+
+    const victoryX = akaza.x + akaza.width / 2;
+    const victoryY = akaza.y + akaza.height / 2;
+
+    akaza.health = 0;
+    gameWon = true;
+    gameOver = false;
+    endSequenceTimer = 0;
+    spawnTimer = 0;
+
+    // Stop the run instantly and cleanly. No more attacks, spawns, or lingering final-form sounds.
+    freezeRunAfterEnd();
+
+    score += 50000;
+    addFoamBurst(victoryX, victoryY, 100);
+    startCameraShake(50, 25);
+    scheduleResultScreen(900);
+}
+
+
 function handlePlayerAttackAgainstBoss() {
     if (!akaza || akazaIntro.active || akaza.health <= 0) return;
     if (!player.isAttacking || player.attackFrame <= 1) return;
@@ -1865,7 +2955,7 @@ function handlePlayerAttackAgainstBoss() {
     const hitBoss = rectsOverlap(player.attackBox, akaza);
     if (hitBoss) {
         if (akaza.invulnerable) { playSound(sfxParryClang); pushClashSparks(akaza.x + akaza.width/2, akaza.y + akaza.height/2, 20, "#38bdf8"); return; }
-        playSound(sfxDemonHit); 
+        if (player.currentForm < 5) playSound(sfxDemonHit); 
 
         let damageValue = attackDamage[player.currentForm] * 3.5;
         akaza.health -= damageValue; player.hitTargets.add("akaza");
@@ -1874,14 +2964,11 @@ function handlePlayerAttackAgainstBoss() {
         addFoamBurst(akaza.x + akaza.width / 2, akaza.y + akaza.height / 2, 8); 
         pushClashSparks(akaza.x + akaza.width / 2, akaza.y + akaza.height / 2, 12, "#ffffff"); 
         
-        combo++; comboTimer = 240; score += 50;
+        if (player.currentForm === 5) { akaza.stunnedTimer = Math.max(akaza.stunnedTimer, 125); pushStunText(akaza.x + akaza.width / 2, akaza.y - 22); addSunFlareBurst(akaza.x + akaza.width / 2, akaza.y + akaza.height / 2, 36); }
+        combo++; comboTimer = 240; score += player.currentForm >= 5 ? 95 : 50;
         
         if (akaza.health <= 0) {
-            akaza.health = 0; gameWon = true; score += 50000;
-            endSequenceTimer = 0; timeScale = 0.2;
-            addFoamBurst(akaza.x + akaza.width / 2, akaza.y + akaza.height / 2, 100); 
-            startCameraShake(50, 25); playSound(sfxBruteSlam);
-            stopBossMusic(); 
+            finishAkazaVictory("direct_hit");
         }
     }
 }
@@ -1945,6 +3032,9 @@ function drawAkazaLetterbox() { if (!akazaIntro.active && akazaIntro.letterbox <
 
 function showResultScreen() {
     if (endScreenShown) return;
+    if (gameState !== "playing") return;
+    if (!(gameOver || gameWon)) return;
+    cancelPlayerActionState({ resetCooldowns: false, clearTrails: true });
     endScreenShown = true;
 
     const endScreen = document.getElementById("endScreen");
@@ -1958,7 +3048,11 @@ function showResultScreen() {
 
     if (!endScreen || !endTitle || !endScore) return;
 
+    recordPlayerCurrentScore(currentMode, score, { updateHighest: false });
+
     endScreen.style.display = "flex";
+    endScreen.style.pointerEvents = "auto";
+    endScreen.classList.add("active");
     endTitle.innerText = gameWon ? "VICTORY" : "DEFEAT";
     endTitle.className = gameWon ? "victory" : "defeat";
     if (endSubtext) endSubtext.innerText = gameWon ? "Akaza defeated. Run complete." : "You fell in battle. Save your score?";
@@ -1985,26 +3079,34 @@ function update() {
     if (gameOver || gameWon) {
         if (!endMusicStopped) {
             endMusicStopped = true;
-            stopBattleMusic();
-            stopBossMusic();
+            freezeRunAfterEnd();
         }
         endSequenceTimer += realDt;
-        if (endSequenceTimer > 180) showResultScreen();
+        if (endSequenceTimer > 95) showResultScreen();
         return; 
     }
 
     updateBreathingSound();
+    if (isCutsceneOrPopupActive()) resetInputState();
     if (!BOSS_TEST_MODE) { updateEnemyRevealPopup(); checkEnemyMilestones(); }
 
     if (akaza || akazaIntro.active) {
         if (akazaIntro.active) { updateAkazaIntro(realDt); dt = timeScale * globalDt; } else { updateAkazaBoss(realDt); }
     }
 
+    if (akaza && !akazaIntro.active && akaza.health <= 0 && !gameWon) {
+        finishAkazaVictory("health_check");
+        return;
+    }
+
     // G breathing no longer slows the whole game. It only restores breathing while leaving the player vulnerable.
     updateTimers(dt, realDt);
 
     if (!akazaIntro.active) { updatePlayerMovement(dt); updatePlayerAttack(dt); handlePlayerAttackAgainstBoss(); }
-    updateParticlesAndTrails(dt); updateJumpBursts(dt); updateShockwaves(dt); updateHealTexts(dt); updateProjectiles(dt); updateDemons(dt); updateHealthDrops(dt); updateCamera(dt); updateBossSmoke(dt);
+    if (gameOver || gameWon) return;
+    updateParticlesAndTrails(dt); updateJumpBursts(dt); updateShockwaves(dt); updateHealTexts(dt); updateProjectiles(dt);
+    if (gameOver || gameWon) return;
+    updateDemons(dt); updateHealthDrops(dt); updateCamera(dt); updateBossSmoke(dt);
 }
 
 function updateTimers(dt, realDt = 1) {
@@ -2016,6 +3118,7 @@ function updateTimers(dt, realDt = 1) {
     if (player.isGuarding) player.guardFrame += dt; if (comboTimer > 0) { comboTimer -= dt; if (comboTimer <= 0) combo = 0; } for (const key in formCooldowns) { if (formCooldowns[key] > 0) formCooldowns[key] -= dt; } if (player.isStunned) { player.stunTimer -= dt; if (player.stunTimer <= 0) player.isStunned = false; }
     if (impactFrameTimer > 0) impactFrameTimer -= dt;
     if (lightImpactFrameTimer > 0) lightImpactFrameTimer -= dt;
+    if (player.formParryLock > 0) player.formParryLock -= dt;
 }
 
 function updatePlayerMovement(dt) {
@@ -2055,21 +3158,98 @@ function updateCamera(dt) {
 
 function updatePlayerAttack(dt) {
     if (!player.isAttacking) return;
+    if (gameState !== "playing" || gameOver || gameWon) {
+        cancelPlayerActionState({ resetCooldowns: false, clearTrails: true });
+        return;
+    }
+
     player.attackFrame += dt;
-    const f = player.attackFrame; const totalF = player.maxAttackFrames; const pct = f / totalF; const direction = player.facing === "right" ? 1 : -1;
-    
-    if (player.currentForm === 2 || player.currentForm === 3) { if (Math.floor(f) % 15 === 0) player.hitTargets.clear(); } else if (player.currentForm === 4) { if (Math.floor(f) % 25 === 0) player.hitTargets.clear(); }
+    const f = player.attackFrame;
+    const totalF = player.maxAttackFrames;
+    const pct = clamp(f / totalF, 0, 1);
+    const direction = player.facing === "right" ? 1 : -1;
+
+    if (player.currentForm === 2 || player.currentForm === 3) {
+        if (Math.floor(f) % 15 === 0) player.hitTargets.clear();
+    } else if (player.currentForm === 4) {
+        if (Math.floor(f) % 25 === 0) player.hitTargets.clear();
+    } else if (player.currentForm === 5) {
+        if (Math.floor(f) % 12 === 0) player.hitTargets.clear();
+    }
+
+    if (isWaterDefenseFormActive()) {
+        player.invincibleTimer = Math.max(player.invincibleTimer, 5);
+    }
+
+    if (isSunDanceActive()) {
+        // Sun Breathing 1st Form: SUN DANCE is the ultimate form: full protection while attacking.
+        player.invincibleTimer = Math.max(player.invincibleTimer, 9);
+        damageFlashTimer = Math.max(damageFlashTimer, 5);
+    }
 
     if (player.currentForm === 1) { 
         player.x += direction * 4.2 * dt; 
         player.attackBox.width = 175; 
         player.attackBox.height = 175; 
         player.attackBox.y = player.y - 45; 
-    } else if (player.currentForm === 2) { const arcH = Math.sin(pct * Math.PI) * 170; player.y = player.baseY - arcH; player.x += direction * 3.5 * dt; player.bodyRotation = pct * Math.PI * 2 * direction; player.attackBox.width = 175; player.attackBox.height = 175; player.attackBox.y = player.y - 48; } else if (player.currentForm === 3) { const leapHeight = 145; const leapIn = clamp(pct / 0.18, 0, 1); const hoverWave = Math.sin(f * 0.18) * 5; if (pct < 0.18) player.y = player.baseY - Math.sin(leapIn * Math.PI * 0.5) * leapHeight; else if (pct < 0.88) { player.y = player.baseY - leapHeight + hoverWave; player.vy = 0; } else { const fallPrep = clamp((pct - 0.88) / 0.12, 0, 1); player.y = player.baseY - leapHeight + hoverWave + fallPrep * 35; player.vy = 0; } player.isGrounded = false; player.bodyRotation = Math.sin(f * 0.16) * 0.16; player.attackBox.width = 370; player.attackBox.height = 370; player.attackBox.y = player.y + player.height / 2 - 185; if (Math.floor(f) % 18 === 0) addFoamBurst(player.x + player.width / 2, player.y + player.height / 2 + 45, 4); } else if (player.currentForm === 4) { updateFlowingDance(f, totalF, pct, direction, dt); } else { player.attackBox.width = 105; player.attackBox.height = 62; player.attackBox.y = player.y + 8; }
-    
-    if (player.currentForm === 3 || player.currentForm === 1) player.attackBox.x = player.x + player.width / 2 - player.attackBox.width / 2; else player.attackBox.x = player.facing === "right" ? player.x + player.width : player.x - player.attackBox.width;
+    } else if (player.currentForm === 2) {
+        const arcH = Math.sin(pct * Math.PI) * 170;
+        player.y = player.baseY - arcH;
+        player.x += direction * 3.5 * dt;
+        player.bodyRotation = pct * Math.PI * 2 * direction;
+        player.attackBox.width = 175;
+        player.attackBox.height = 175;
+        player.attackBox.y = player.y - 48;
+    } else if (player.currentForm === 3) {
+        const leapHeight = 145;
+        const leapIn = clamp(pct / 0.18, 0, 1);
+        const hoverWave = Math.sin(f * 0.18) * 5;
+        if (pct < 0.18) player.y = player.baseY - Math.sin(leapIn * Math.PI * 0.5) * leapHeight;
+        else if (pct < 0.88) { player.y = player.baseY - leapHeight + hoverWave; player.vy = 0; }
+        else { const fallPrep = clamp((pct - 0.88) / 0.12, 0, 1); player.y = player.baseY - leapHeight + hoverWave + fallPrep * 35; player.vy = 0; }
+        player.isGrounded = false;
+        player.bodyRotation = Math.sin(f * 0.16) * 0.16;
+        player.attackBox.width = 370;
+        player.attackBox.height = 370;
+        player.attackBox.y = player.y + player.height / 2 - 185;
+        if (Math.floor(f) % 18 === 0) addFoamBurst(player.x + player.width / 2, player.y + player.height / 2 + 45, 4);
+    } else if (player.currentForm === 4) {
+        updateFlowingDance(f, totalF, pct, direction, dt);
+    } else if (player.currentForm === 5) {
+        // Sun Dance: the original hot circular dash from the first Sun/Raging Sun build.
+        const rise = Math.sin(pct * Math.PI) * 92;
+        const spiral = Math.sin(pct * Math.PI * 4.2) * 16;
+        player.x += direction * (7.4 + Math.sin(pct * Math.PI) * 5.2) * dt;
+        player.y = player.baseY - rise + spiral;
+        player.isGrounded = false;
+        player.bodyRotation = direction * (pct * Math.PI * 2.65 - 0.4);
+        player.attackBox.width = 470;
+        player.attackBox.height = 315;
+        player.attackBox.y = player.y + player.height / 2 - 185;
+        if (Math.floor(f) % 2 === 0) {
+            addSunFlareBurst(player.x + player.width / 2, player.y + player.height / 2, 2);
+        }
+        if (Math.floor(f) % 8 === 0) {
+            pushParrySlash(player.x + player.width / 2 + direction * 45, player.y + player.height / 2);
+        }
+    } else {
+        player.attackBox.width = 105;
+        player.attackBox.height = 62;
+        player.attackBox.y = player.y + 8;
+    }
+
+    if (player.currentForm === 3 || player.currentForm === 1 || player.currentForm === 5) {
+        player.attackBox.x = player.x + player.width / 2 - player.attackBox.width / 2;
+    } else {
+        player.attackBox.x = player.facing === "right" ? player.x + player.width : player.x - player.attackBox.width;
+    }
+
     player.x = clamp(player.x, 0, MAP_WIDTH - player.width);
-    if (player.currentForm !== 4 && f > 1 && Math.floor(f) % 3 === 0) { pushWaterTrail({ form: player.currentForm, x: player.attackBox.x, y: player.attackBox.y, w: player.attackBox.width, h: player.attackBox.height, facing: player.facing, frame: f, maxFrame: totalF, alpha: 1, playerX: player.x, playerY: player.y, m1Step: player.m1Step }); }
+
+    if (player.currentForm !== 4 && f > 1 && Math.floor(f) % 3 === 0) {
+        pushWaterTrail({ form: player.currentForm, x: player.attackBox.x, y: player.attackBox.y, w: player.attackBox.width, h: player.attackBox.height, facing: player.facing, frame: f, maxFrame: totalF, alpha: 1, playerX: player.x, playerY: player.y, m1Step: player.m1Step });
+    }
+
     if (f >= totalF) endAttack();
 }
 
@@ -2082,14 +3262,15 @@ function updateFlowingDance(frame, totalFrames, progress, direction, dt) {
 function endAttack() {
     const finishedForm = player.currentForm; if (player.currentForm > 0) formCooldowns[player.currentForm] = maxCooldowns[player.currentForm];
     player.isAttacking = false; player.attackFrame = 0; player.hitTargets.clear(); player.m1AlreadyHit = false;
-    if (finishedForm === 3) { player.isGrounded = false; player.vy = 4.2; } else player.y = player.isGrounded ? player.baseY : player.y; player.bodyRotation = 0; player.currentForm = 0; player.selectedForm = 0;
+    if (finishedForm === 3 || finishedForm === 5) { player.isGrounded = false; player.vy = 4.2; } else player.y = player.isGrounded ? player.baseY : player.y; player.bodyRotation = 0; player.sunSecondHitReset = false; player.sunImpactLock = false; player.formParryLock = 0; player.currentForm = 0; player.selectedForm = 0;
 }
 
 function updateParticlesAndTrails(dt) {
-    for (let i = waterTrails.length - 1; i >= 0; i--) { const trail = waterTrails[i]; let fadeSpeed = 0.034; if (trail.form === 3) fadeSpeed = 0.022; if (trail.form === 4) fadeSpeed = 0.028; trail.alpha -= fadeSpeed * dt; if (trail.alpha <= 0) waterTrails.splice(i, 1); }
+    for (let i = waterTrails.length - 1; i >= 0; i--) { const trail = waterTrails[i]; let fadeSpeed = 0.034; if (trail.form === 3) fadeSpeed = 0.022; if (trail.form === 4) fadeSpeed = 0.028; if (trail.form === 5) fadeSpeed = 0.018; trail.alpha -= fadeSpeed * dt; if (trail.alpha <= 0) waterTrails.splice(i, 1); }
     for (let i = foamParticles.length - 1; i >= 0; i--) { const p = foamParticles[i]; p.x += p.vx * dt; p.y += p.vy * dt; p.alpha -= p.decay * dt; if (p.alpha <= 0) foamParticles.splice(i, 1); }
     for (let i = clashSparks.length - 1; i >= 0; i--) { const s = clashSparks[i]; s.x += s.vx * dt; s.y += s.vy * dt; s.vx *= 0.92; s.vy *= 0.92; s.alpha -= 0.06 * dt; if (s.alpha <= 0) clashSparks.splice(i, 1); }
     for (let i = parrySlashes.length - 1; i >= 0; i--) { const p = parrySlashes[i]; p.radius += 9 * dt; p.alpha -= 0.055 * dt; if (p.alpha <= 0) parrySlashes.splice(i, 1); }
+    for (let i = afterglowFistStreaks.length - 1; i >= 0; i--) { const s = afterglowFistStreaks[i]; s.alpha -= 0.105 * dt; s.length *= Math.pow(0.975, dt); if (s.alpha <= 0) afterglowFistStreaks.splice(i, 1); }
 }
 function updateJumpBursts(dt) { for (let i = jumpBursts.length - 1; i >= 0; i--) { const b = jumpBursts[i]; b.radius += b.type === "land" ? 5 * dt : 4 * dt; b.alpha -= 0.055 * dt; if (b.alpha <= 0) jumpBursts.splice(i, 1); } }
 function updateShockwaves(dt) { 
@@ -2099,15 +3280,21 @@ function updateShockwaves(dt) {
         sw.alpha -= 0.045 * dt; 
         const playerCenterX = player.x + player.width / 2; 
         const playerCenterY = player.y + player.height / 2; 
-        const dist = distanceBetween(sw.x, sw.y, playerCenterX, playerCenterY); 
-        if (!sw.hasHitPlayer && dist <= sw.radius + 14 && dist >= sw.radius - 40 && sw.damage > 0) { 
+        const dist = distanceBetween(sw.x, sw.y, playerCenterX, playerCenterY);
+        const formBox = getActiveFormDefenseBox();
+        const formCenterX = formBox.x + formBox.width / 2;
+        const formCenterY = formBox.y + formBox.height / 2;
+        const formDist = distanceBetween(sw.x, sw.y, formCenterX, formCenterY);
+        const hitPlayerWave = dist <= sw.radius + 14 && dist >= sw.radius - 40;
+        const hitFormWave = isFormDefenseActive() && formDist <= sw.radius + Math.max(formBox.width, formBox.height) * 0.35 && formDist >= sw.radius - 70;
+        if (!sw.hasHitPlayer && (hitPlayerWave || hitFormWave) && sw.damage > 0) { 
             sw.hasHitPlayer = true; 
             handleGuardOrParryAgainstPhysical(sw.owner, sw.damage); 
         } 
         if (sw.radius >= sw.maxRadius || sw.alpha <= 0) shockwaves.splice(i, 1); 
     } 
 }
-function updateHealTexts(dt) { for (let i = healTexts.length - 1; i >= 0; i--) { const h = healTexts[i]; h.y += h.vy * dt; h.life -= dt; h.alpha = h.life / 70; if (h.life <= 0) healTexts.splice(i, 1); } }
+function updateHealTexts(dt) { for (let i = healTexts.length - 1; i >= 0; i--) { const h = healTexts[i]; h.y += h.vy * dt; h.life -= dt; h.alpha = h.life / (h.maxLife || 70); if (h.life <= 0) healTexts.splice(i, 1); } }
 
 // =====================================================
 // PROJECTILES
@@ -2120,17 +3307,42 @@ function updateProjectiles(dt) {
 
         if (pr.deflected) {
             if (akaza) {
-                if (pr.x > akaza.x && pr.x < akaza.x + akaza.width && pr.y > akaza.y && pr.y < akaza.y + akaza.height) { akaza.health -= 5; addFoamBurst(akaza.x + akaza.width / 2, akaza.y + akaza.height / 2, 8); projectiles.splice(i, 1); playSound(sfxProjectileHit); playSound(sfxDemonHit); continue; }
+                if (pr.x > akaza.x && pr.x < akaza.x + akaza.width && pr.y > akaza.y && pr.y < akaza.y + akaza.height) {
+                    akaza.health -= 5;
+                    addFoamBurst(akaza.x + akaza.width / 2, akaza.y + akaza.height / 2, 8);
+                    projectiles.splice(i, 1);
+                    playSound(sfxProjectileHit);
+                    playSound(sfxDemonHit);
+                    if (akaza.health <= 0) finishAkazaVictory("deflected_projectile");
+                    continue;
+                }
             } else {
                 for (let j = demons.length - 1; j >= 0; j--) { const d = demons[j]; if (pr.x > d.x && pr.x < d.x + d.width && pr.y > d.y && pr.y < d.y + d.height) { d.health -= 3; addFoamBurst(d.x + d.width / 2, d.y + d.height / 2, 8); projectiles.splice(i, 1); playSound(sfxProjectileHit); playSound(sfxDemonHit); if (d.health <= 0) killDemon(j, d); break; } }
             }
         } else {
             const playerRect = { x: player.x, y: player.y, width: player.width, height: player.height };
             const hitPlayer = circleRectCollision(pr.x, pr.y, pr.radius, playerRect, player.isGuarding ? 42 : 6);
-            const hitAttack = player.isAttacking && player.currentForm > 0 && player.attackFrame > 1 && circleRectCollision(pr.x, pr.y, pr.radius, player.attackBox, 12);
-            
+            const hitWaterWheel = isWaterWheelProjectileDeflectActive() && circleRectCollision(pr.x, pr.y, pr.radius, getWaterWheelDeflectBox(), 12);
+            const hitAttack = isFormDefenseActive() && circleRectCollision(pr.x, pr.y, pr.radius, getActiveFormDefenseBox(), 12);
+
+            if (hitWaterWheel) {
+                deflectProjectileWithWaterWheel(pr);
+                continue;
+            }
+
             if (hitPlayer || hitAttack) {
-                if (player.isGuarding || hitAttack) { 
+                if (hitAttack || (hitPlayer && isFormDefenseActive())) {
+                    if (isSunDanceActive()) {
+                        pr.vx = -pr.vx * 1.85; pr.vy = (Math.random() - 0.5) * 4.5; pr.color = "#f97316"; pr.deflected = true;
+                        addSunFlareBurst(pr.x, pr.y, 8); doFormParry(null, pr.x, pr.y);
+                    } else {
+                        playSound(sfxProjectileHit);
+                        addFoamBurst(pr.x, pr.y, 12);
+                        pushClashSparks(pr.x, pr.y, 24, "#38bdf8");
+                        doFormDefense(null, pr.x, pr.y);
+                        projectiles.splice(i, 1);
+                    }
+                } else if (player.isGuarding) { 
                     pr.vx = -pr.vx * 1.5; pr.vy = (Math.random() - 0.5) * 3; pr.color = "#38bdf8"; pr.deflected = true; addFoamBurst(pr.x, pr.y, 10); playSound(sfxParryClang); pushClashSparks(pr.x, pr.y, 20, "#fb923c"); 
                     if (isPerfectParryWindow()) { 
                         doPerfectParry(null, true); // True flag handled inside for +8 HP
@@ -2199,9 +3411,9 @@ function updateSwiftMovement(d, dt, dist, dir) { if (d.attackWindup > 0) return;
 function updateBruteMovement(d, dt, dist, dir) { if (d.slamWindup > 0) { d.slamWindup -= dt; d.attackFlash = Math.max(d.attackFlash, 5); if (d.slamWindup <= 0) { d.slamCooldown = 260; d.attackCooldown = 145; playSound(sfxBruteSlam); startCameraShake(12, 9); addFoamBurst(d.x + d.width / 2, d.y + d.height, 24); pushShockwave(d.x + d.width / 2, d.y + d.height - 5, 185, 12, d, "#fb923c", 8, 8); } return; } if (d.attackWindup > 0) return; if (dist > 95) d.x += dir * d.speed * dt; else d.x -= dir * 0.2 * dt; if (d.slamCooldown <= 0 && dist < 210) { d.slamWindup = 48; d.attackFlash = 48; playSound(sfxBruteWindup); } d.x = clamp(d.x, 0, MAP_WIDTH - d.width); }
 
 function updateDemonAttack(d, dt) { if (d.type === "sniper") return; const playerCenter = player.x + player.width / 2; const demonCenter = d.x + d.width / 2; const dist = Math.abs(playerCenter - demonCenter); if (d.type === "swift") { updateSwiftAttack(d, dist, dt); return; } if (d.type === "brute") { updateBruteAttack(d, dist, dt); return; } updateGruntAttack(d, dist, dt); }
-function updateGruntAttack(d, dist, dt) { if (dist <= d.attackRange + 12 && d.attackCooldown <= 0 && d.attackWindup <= 0) { d.attackWindup = 26; d.attackFlash = d.attackWindup; d.attackHasHit = false; playSound(sfxGruntAttack); } if (d.attackWindup > 0) { d.attackWindup -= dt; if (d.attackWindup <= 0) { d.attackCooldown = 105; if (!d.attackHasHit && rectsOverlap(getDemonAttackBox(d), getPlayerBox())) { d.attackHasHit = true; handleGuardOrParryAgainstPhysical(d, 5); } } } }
-function updateSwiftAttack(d, dist, dt) { const swiftHitBox = { x: d.x - 10, y: d.y + 8, width: d.width + 20, height: d.height - 8 }; if (d.dashDamageBoxTimer > 0) { d.dashDamageBoxTimer -= dt; if (!d.attackHasHit && rectsOverlap(swiftHitBox, getPlayerBox())) { d.attackHasHit = true; playSound(sfxSwiftAttack); handleGuardOrParryAgainstPhysical(d, 7); } } if (dist <= d.attackRange + 8 && d.attackCooldown <= 0 && d.attackWindup <= 0 && d.dashTimer <= 0) { d.attackWindup = 18; d.attackFlash = d.attackWindup; d.attackHasHit = false; playSound(sfxSwiftAttack); } if (d.attackWindup > 0) { d.attackWindup -= dt; if (d.attackWindup <= 0) { d.attackCooldown = 95; if (!d.attackHasHit && rectsOverlap(getDemonAttackBox(d), getPlayerBox())) { d.attackHasHit = true; handleGuardOrParryAgainstPhysical(d, 6); } } } }
-function updateBruteAttack(d, dist, dt) { if (d.slamWindup > 0) return; if (dist <= d.attackRange + 12 && d.attackCooldown <= 0 && d.attackWindup <= 0) { d.attackWindup = 38; d.attackFlash = d.attackWindup; d.attackHasHit = false; playSound(sfxBruteWindup); } if (d.attackWindup > 0) { d.attackWindup -= dt; if (d.attackWindup <= 0) { d.attackCooldown = 145; playSound(sfxBruteSlam); startCameraShake(7, 5); if (!d.attackHasHit && rectsOverlap(getDemonAttackBox(d), getPlayerBox())) { d.attackHasHit = true; handleGuardOrParryAgainstPhysical(d, 10); } } } }
+function updateGruntAttack(d, dist, dt) { if (dist <= d.attackRange + 12 && d.attackCooldown <= 0 && d.attackWindup <= 0) { d.attackWindup = 26; d.attackFlash = d.attackWindup; d.attackHasHit = false; playSound(sfxGruntAttack); } if (d.attackWindup > 0) { d.attackWindup -= dt; if (d.attackWindup <= 0) { d.attackCooldown = 105; if (!d.attackHasHit && (rectsOverlap(getDemonAttackBox(d), getPlayerBox()) || (isFormDefenseActive() && rectsOverlap(getDemonAttackBox(d), getActiveFormParryBox())))) { d.attackHasHit = true; handleGuardOrParryAgainstPhysical(d, 5); } } } }
+function updateSwiftAttack(d, dist, dt) { const swiftHitBox = { x: d.x - 10, y: d.y + 8, width: d.width + 20, height: d.height - 8 }; if (d.dashDamageBoxTimer > 0) { d.dashDamageBoxTimer -= dt; if (!d.attackHasHit && (rectsOverlap(swiftHitBox, getPlayerBox()) || (isFormDefenseActive() && rectsOverlap(swiftHitBox, getActiveFormParryBox())))) { d.attackHasHit = true; playSound(sfxSwiftAttack); handleGuardOrParryAgainstPhysical(d, 7); } } if (dist <= d.attackRange + 8 && d.attackCooldown <= 0 && d.attackWindup <= 0 && d.dashTimer <= 0) { d.attackWindup = 18; d.attackFlash = d.attackWindup; d.attackHasHit = false; playSound(sfxSwiftAttack); } if (d.attackWindup > 0) { d.attackWindup -= dt; if (d.attackWindup <= 0) { d.attackCooldown = 95; if (!d.attackHasHit && (rectsOverlap(getDemonAttackBox(d), getPlayerBox()) || (isFormDefenseActive() && rectsOverlap(getDemonAttackBox(d), getActiveFormParryBox())))) { d.attackHasHit = true; handleGuardOrParryAgainstPhysical(d, 6); } } } }
+function updateBruteAttack(d, dist, dt) { if (d.slamWindup > 0) return; if (dist <= d.attackRange + 12 && d.attackCooldown <= 0 && d.attackWindup <= 0) { d.attackWindup = 38; d.attackFlash = d.attackWindup; d.attackHasHit = false; playSound(sfxBruteWindup); } if (d.attackWindup > 0) { d.attackWindup -= dt; if (d.attackWindup <= 0) { d.attackCooldown = 145; playSound(sfxBruteSlam); startCameraShake(7, 5); if (!d.attackHasHit && (rectsOverlap(getDemonAttackBox(d), getPlayerBox()) || (isFormDefenseActive() && rectsOverlap(getDemonAttackBox(d), getActiveFormParryBox())))) { d.attackHasHit = true; handleGuardOrParryAgainstPhysical(d, 10); } } } }
 function getPlayerBox() { return { x: player.x, y: player.y, width: player.width, height: player.height }; }
 function getDemonAttackBox(d) { const facingRight = d.x + d.width / 2 < player.x + player.width / 2; const range = d.type === "brute" ? 78 : d.type === "swift" ? 60 : 48; return { x: facingRight ? d.x + d.width : d.x - range, y: d.y + 10, width: range, height: d.height - 8 }; }
 function handlePlayerAttackAgainstDemon(index, d) { 
@@ -2214,19 +3426,21 @@ function handlePlayerAttackAgainstDemon(index, d) {
         return; 
     } 
     
-    playSound(sfxDemonHit); 
+    if (player.currentForm < 5) playSound(sfxDemonHit); 
     
     let damageValue = attackDamage[player.currentForm]; 
     if (player.currentForm === 1 && d.type === "swift") damageValue += 1; 
     if (player.currentForm === 2 && d.type === "swift") damageValue += 1; 
     if (player.currentForm === 3 && d.type === "brute") damageValue += 2; 
     if (player.currentForm === 4) damageValue += 1; 
+    if (player.currentForm === 5 && d.type === "brute") damageValue += 14;
     d.health -= damageValue; player.hitTargets.add(d.id); 
     if (player.currentForm === 0) player.m1AlreadyHit = true; 
     addFoamBurst(d.x + d.width / 2, d.y + d.height / 2, 8); 
-    pushClashSparks(d.x + d.width / 2, d.y + d.height / 2, 12, "#ffffff"); 
+    pushClashSparks(d.x + d.width / 2, d.y + d.height / 2, player.currentForm >= 5 ? 28 : 12, player.currentForm >= 5 ? "#fbbf24" : "#ffffff"); 
+    if (player.currentForm === 5) { d.stunnedTimer = Math.max(d.stunnedTimer, 145); pushStunText(d.x + d.width / 2, d.y - 18); addSunFlareBurst(d.x + d.width / 2, d.y + d.height / 2, 20); }
     
-    combo++; comboTimer = 240; score += 20; 
+    combo++; comboTimer = 240; score += player.currentForm >= 5 ? 45 : 20; 
     if (d.health <= 0) killDemon(index, d); 
 }
 
@@ -2245,7 +3459,11 @@ function killDemon(index, d) {
 // DRAWING
 // =====================================================
 function draw() {
-    if (gameState !== "playing") return;
+    resetCanvasContextState();
+    if (gameState !== "playing") {
+        if (gameState === "menu" || gameState === "splash") clearGameplayCanvas();
+        return;
+    }
     
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.save(); ctx.translate(screenShakeX, screenShakeY); ctx.save();
@@ -2259,7 +3477,7 @@ function draw() {
         ctx.translate(-cx, -cy); 
     }
     
-    drawBackground(); drawAkazaCompass(); drawParticles(); drawJumpBursts(); drawShockwaves(); drawAkazaShockRings(); drawWaterTrails(); drawHealthDrops(); drawPlayer(); drawProjectiles(); drawEnemies(); drawAkaza(); drawAkazaSmoke(); drawBossSmoke(); drawCombatSparks(); drawHealTexts();
+    drawBackground(); drawAkazaCompass(); drawParticles(); drawJumpBursts(); drawShockwaves(); drawAkazaShockRings(); drawWaterTrails(); drawHealthDrops(); drawPlayer(); drawProjectiles(); drawEnemies(); drawAkaza(); drawAkazaSmoke(); drawBossSmoke(); drawAfterglowFistStreaks(); drawCombatSparks(); drawHealTexts();
     ctx.restore();
     if (!BOSS_TEST_MODE) drawEnemyProgressBar();
     drawHUD(); drawEnemyRevealPopup(); drawAkazaLetterbox();
@@ -2312,7 +3530,7 @@ function drawBackground() {
     ctx.fillStyle = "rgba(90, 20, 10, 0.18)"; ctx.fillRect(0, 0, canvas.width, canvas.height); ctx.fillStyle = "rgba(5, 4, 6, 0.9)"; ctx.fillRect(0, GROUND_Y, canvas.width, canvas.height - GROUND_Y); ctx.fillStyle = "#7c2d12"; ctx.fillRect(0, GROUND_Y, canvas.width, 4); ctx.fillStyle = "rgba(255, 120, 40, 0.35)"; ctx.fillRect(0, GROUND_Y + 4, canvas.width, 2);
 }
 
-function drawParticles() { foamParticles.forEach((p) => { drawWaveFoam(p.x - cameraX, p.y, p.radius, p.alpha); }); }
+function drawParticles() { foamParticles.forEach((p) => { ctx.save(); ctx.globalAlpha = p.alpha; ctx.shadowBlur = 14; ctx.shadowColor = p.shadow || "#38bdf8"; ctx.fillStyle = p.color || "#ffffff"; ctx.strokeStyle = p.shadow || "#1d4ed8"; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(p.x - cameraX, p.y, p.radius, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); ctx.restore(); }); }
 function drawJumpBursts() { jumpBursts.forEach((b) => { ctx.save(); ctx.globalAlpha = b.alpha; ctx.strokeStyle = b.type === "land" ? "#e0f2fe" : "#38bdf8"; ctx.lineWidth = b.type === "land" ? 4 : 3; ctx.beginPath(); ctx.ellipse(b.x - cameraX, b.y, b.radius * 1.5, b.radius * 0.35, 0, 0, Math.PI * 2); ctx.stroke(); ctx.restore(); }); }
 
 function drawShockwaves() { 
@@ -2333,9 +3551,52 @@ function drawShockwaves() {
     }); 
 }
 
+function drawAfterglowFistStreaks() {
+    afterglowFistStreaks.forEach((s) => {
+        ctx.save();
+        ctx.translate(s.x - cameraX, s.y);
+        ctx.rotate(s.angle);
+        ctx.globalAlpha = Math.max(0, s.alpha);
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.shadowBlur = 62;
+        ctx.shadowColor = s.color;
+
+        // thick blue-white punch trail, glow shell, then sharp white core
+        ctx.strokeStyle = s.color === "#ffffff" ? "rgba(255,255,255,0.34)" : "rgba(14,165,233,0.34)";
+        ctx.lineWidth = s.width * 2.35;
+        ctx.beginPath();
+        ctx.moveTo(-s.length * 0.08, s.curl * 0.1);
+        ctx.quadraticCurveTo(s.length * 0.45, s.curl, s.length * 1.04, 0);
+        ctx.stroke();
+
+        ctx.strokeStyle = s.color === "#ffffff" ? "rgba(224,242,254,0.92)" : "rgba(56,189,248,0.94)";
+        ctx.lineWidth = s.width;
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.quadraticCurveTo(s.length * 0.45, s.curl, s.length, 0);
+        ctx.stroke();
+
+        ctx.strokeStyle = "rgba(255,255,255,0.96)";
+        ctx.lineWidth = Math.max(2, s.width * 0.28);
+        ctx.beginPath();
+        ctx.moveTo(s.length * 0.08, 0);
+        ctx.quadraticCurveTo(s.length * 0.52, s.curl * 0.45, s.length * 0.92, 0);
+        ctx.stroke();
+
+        ctx.strokeStyle = "rgba(14,165,233,0.46)";
+        ctx.lineWidth = Math.max(3, s.width * 0.45);
+        ctx.beginPath();
+        ctx.moveTo(-s.length * 0.22, s.curl * 0.18);
+        ctx.lineTo(s.length * 0.45, s.curl * 0.55);
+        ctx.stroke();
+        ctx.restore();
+    });
+}
+
 function drawCombatSparks() { parrySlashes.forEach((p) => { ctx.save(); ctx.translate(p.x - cameraX, p.y); ctx.rotate(p.rotation); ctx.globalAlpha = p.alpha; ctx.shadowBlur = 35; ctx.shadowColor = "#f97316"; ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 8; ctx.beginPath(); ctx.moveTo(-p.radius, -p.radius * 0.35); ctx.lineTo(p.radius, p.radius * 0.35); ctx.stroke(); ctx.strokeStyle = "#fb923c"; ctx.lineWidth = 5; ctx.beginPath(); ctx.moveTo(-p.radius * 0.85, p.radius * 0.35); ctx.lineTo(p.radius * 0.85, -p.radius * 0.35); ctx.stroke(); ctx.strokeStyle = "#38bdf8"; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(-p.radius * 0.5, 0); ctx.lineTo(p.radius * 0.5, 0); ctx.stroke(); ctx.restore(); }); clashSparks.forEach((s) => { ctx.save(); ctx.globalAlpha = s.alpha; ctx.strokeStyle = s.color; ctx.shadowBlur = 15; ctx.shadowColor = s.color; ctx.lineWidth = 3; const angle = Math.atan2(s.vy, s.vx); ctx.beginPath(); ctx.moveTo(s.x - cameraX, s.y); ctx.lineTo(s.x - cameraX - Math.cos(angle) * s.length, s.y - Math.sin(angle) * s.length); ctx.stroke(); ctx.restore(); }); }
 function drawWaveFoam(x, y, radius, alpha) { ctx.save(); ctx.globalAlpha = alpha; ctx.fillStyle = "#ffffff"; ctx.strokeStyle = "#1d4ed8"; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); ctx.restore(); }
-function drawWaterTrails() { waterTrails.forEach((t) => { ctx.save(); ctx.globalAlpha = t.alpha; ctx.shadowBlur = 25; const centerHandX = t.facing === "right" ? t.playerX + player.width : t.playerX; const centerHandY = t.playerY + player.height / 2; if (t.form === 1) drawForm1Trail(t); else if (t.form === 2) drawForm2Trail(t, centerHandX, centerHandY); else if (t.form === 3) drawForm3Trail(t); else if (t.form === 4) drawForm4Trail(t); else drawM1Trail(t, centerHandX, centerHandY); ctx.restore(); }); }
+function drawWaterTrails() { waterTrails.forEach((t) => { ctx.save(); ctx.globalAlpha = t.alpha; ctx.shadowBlur = 25; const centerHandX = t.facing === "right" ? t.playerX + player.width : t.playerX; const centerHandY = t.playerY + player.height / 2; if (t.form === 1) drawForm1Trail(t); else if (t.form === 2) drawForm2Trail(t, centerHandX, centerHandY); else if (t.form === 3) drawForm3Trail(t); else if (t.form === 4) drawForm4Trail(t); else if (t.form === 5) drawSunDanceTrail(t); else drawM1Trail(t, centerHandX, centerHandY); ctx.restore(); }); }
 
 function drawForm1Trail(t) { 
     const progress = t.frame / t.maxFrame;
@@ -2373,6 +3634,73 @@ function drawForm2Trail(t, centerHandX, centerHandY) { ctx.shadowColor = "#06b6d
 function drawForm3Trail(t) { ctx.shadowColor = "#38bdf8"; const angle = (t.frame * 0.4) % (Math.PI * 2); const radius = 135; const centerX = t.playerX + player.width / 2 - cameraX; const centerY = t.playerY + player.height / 2; ctx.strokeStyle = "#1e40af"; ctx.lineWidth = 25; ctx.beginPath(); ctx.arc(centerX, centerY, radius, angle, angle + Math.PI, false); ctx.stroke(); ctx.strokeStyle = "#06b6d4"; ctx.lineWidth = 12; ctx.beginPath(); ctx.arc(centerX, centerY, radius, angle + Math.PI / 2, angle + Math.PI * 1.5, false); ctx.stroke(); for (let a = 0; a < Math.PI * 2; a += 0.55) { const r = radius + Math.sin(t.frame * 0.25 + a) * 14; const fx = centerX + Math.cos(a + angle) * r; const fy = centerY + Math.sin(a + angle) * r; drawWaveFoam(fx, fy, 7, t.alpha * 0.9); } }
 function drawForm4Trail(t) { const dir = t.facing === "right" ? 1 : -1; const progress = t.frame / t.maxFrame; const startX = t.playerX + player.width / 2 - cameraX; const startY = t.playerY + player.height / 2; ctx.shadowColor = "#38bdf8"; ctx.shadowBlur = 28; ctx.lineCap = "round"; ctx.lineJoin = "round"; drawFlowingDanceRibbon(startX, startY, dir, progress, 30, `rgba(30, 64, 175, ${t.alpha * 0.65})`); drawFlowingDanceRibbon(startX, startY, dir, progress, 12, `rgba(56, 189, 248, ${t.alpha})`); drawFlowingDanceRibbon(startX, startY - 8, dir, progress, 4, `rgba(255, 255, 255, ${t.alpha * 0.85})`); for (let i = 0; i <= 1; i += 0.2) { const wave = Math.sin((i + progress) * Math.PI * 3.6); const curl = Math.sin((i + progress) * Math.PI * 1.8); const x = startX + dir * (i * 380 - 100); const y = startY + wave * 58 + curl * 22; drawWaveFoam(x, y, 5, t.alpha * 0.75); } }
 function drawFlowingDanceRibbon(startX, startY, dir, progress, lineWidth, color) { ctx.strokeStyle = color; ctx.lineWidth = lineWidth; ctx.beginPath(); for (let i = 0; i <= 1.001; i += 0.075) { const wave = Math.sin((i + progress) * Math.PI * 3.6); const curl = Math.sin((i + progress) * Math.PI * 1.8); const x = startX + dir * (i * 380 - 100); const y = startY + wave * 58 + curl * 22; if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y); } ctx.stroke(); }
+function drawSunDanceTrail(t) {
+    const dir = t.facing === "right" ? 1 : -1;
+    const progress = clamp(t.frame / t.maxFrame, 0, 1);
+    const cx = t.playerX + player.width / 2 - cameraX;
+    const cy = t.playerY + player.height / 2;
+    const radius = 96 + Math.sin(progress * Math.PI) * 70;
+    const start = dir === 1 ? -Math.PI * 0.9 : Math.PI * 0.1;
+    const sweep = Math.PI * 2.25 * progress * dir;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.shadowBlur = 42;
+    ctx.shadowColor = "#ef4444";
+
+    ctx.strokeStyle = `rgba(127, 29, 29, ${t.alpha * 0.82})`;
+    ctx.lineWidth = 44;
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, start, start + sweep, dir < 0);
+    ctx.stroke();
+
+    ctx.strokeStyle = `rgba(249, 115, 22, ${t.alpha})`;
+    ctx.lineWidth = 24;
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius * 0.92, start + 0.2 * dir, start + sweep + 0.2 * dir, dir < 0);
+    ctx.stroke();
+
+    ctx.strokeStyle = `rgba(254, 240, 138, ${t.alpha * 0.95})`;
+    ctx.lineWidth = 7;
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius * 0.82, start + 0.35 * dir, start + sweep + 0.35 * dir, dir < 0);
+    ctx.stroke();
+
+    // Constant slash cuts inside the Sun Dance path.
+    ctx.shadowBlur = 30;
+    ctx.shadowColor = "#fbbf24";
+    for (let i = 0; i < 7; i++) {
+        const q = i / 6;
+        if (q > progress + 0.2) continue;
+        const a = start + sweep * q + Math.sin(progress * 12 + i) * 0.16;
+        const r = radius * (0.58 + 0.34 * ((i % 3) / 2));
+        const sx = cx + Math.cos(a) * (r - 42);
+        const sy = cy + Math.sin(a) * (r - 42);
+        const ex = cx + Math.cos(a + 0.55 * dir) * (r + 54);
+        const ey = cy + Math.sin(a + 0.55 * dir) * (r + 54);
+        ctx.strokeStyle = `rgba(255, 247, 173, ${t.alpha * (0.72 - i * 0.045)})`;
+        ctx.lineWidth = 5 + (i % 2) * 3;
+        ctx.beginPath();
+        ctx.moveTo(sx, sy);
+        ctx.lineTo(ex, ey);
+        ctx.stroke();
+        ctx.strokeStyle = `rgba(239, 68, 68, ${t.alpha * 0.45})`;
+        ctx.lineWidth = 13;
+        ctx.beginPath();
+        ctx.moveTo(sx - 8 * dir, sy + 4);
+        ctx.lineTo(ex - 8 * dir, ey + 4);
+        ctx.stroke();
+    }
+
+    for (let i = 0; i < 5; i++) {
+        const a = start + sweep * (i / 4) + Math.sin(progress * 10 + i) * 0.18;
+        const r = radius + Math.sin(i + progress * Math.PI) * 24;
+        ctx.fillStyle = `rgba(251, 191, 36, ${t.alpha * 0.65})`;
+        ctx.beginPath();
+        ctx.arc(cx + Math.cos(a) * r, cy + Math.sin(a) * r, 8 + i * 1.2, 0, Math.PI * 2);
+        ctx.fill();
+    }
+}
+
 function drawM1Trail(t, centerHandX, centerHandY) { ctx.shadowColor = "#ffffff"; ctx.strokeStyle = "rgba(56, 189, 248, 0.4)"; ctx.lineWidth = 12; const sx = centerHandX - cameraX; const dir = t.facing === "right" ? 1 : -1; ctx.beginPath(); if (t.m1Step === 1) { ctx.moveTo(sx, centerHandY - 10); ctx.lineTo(sx + 80 * dir, centerHandY + 10); } else if (t.m1Step === 2) { ctx.moveTo(sx, centerHandY - 40); ctx.lineTo(sx + 80 * dir, centerHandY + 40); } else if (t.m1Step === 3) { ctx.moveTo(sx + 30 * dir, centerHandY - 50); ctx.lineTo(sx + 30 * dir, centerHandY + 50); } else if (t.m1Step === 4) { ctx.moveTo(sx, centerHandY + 40); ctx.lineTo(sx + 80 * dir, centerHandY - 40); } else { ctx.moveTo(sx, centerHandY - 10); ctx.lineTo(sx + 80 * dir, centerHandY + 10); } ctx.stroke(); ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 3; ctx.stroke(); }
 
 function drawPlayer() {
@@ -2386,10 +3714,65 @@ function drawPlayerBody() {
 function drawSword() {
     let handX = player.facing === "right" ? player.width / 2 : -player.width / 2; let handY = 5; let swordAngle = player.facing === "right" ? 0.6 : Math.PI - 0.6; const swordLength = 54;
     if (player.isGuarding) { swordAngle = -Math.PI / 2; handY = -2; handX = player.facing === "right" ? 14 : -14; }
-    else if (player.isAttacking) { const progress = player.attackFrame / player.maxAttackFrames; if (player.currentForm === 0) { const p = progress * Math.PI; if (player.m1Step === 1) swordAngle = player.facing === "right" ? -Math.PI / 3 + p : Math.PI + Math.PI / 3 - p; else if (player.m1Step === 2) swordAngle = player.facing === "right" ? -Math.PI / 2 + p * 1.2 : Math.PI + Math.PI / 2 - p * 1.2; else if (player.m1Step === 3) swordAngle = player.facing === "right" ? -Math.PI / 1.5 + p : Math.PI + Math.PI / 1.5 - p; else if (player.m1Step === 4) swordAngle = player.facing === "right" ? Math.PI / 4 - p : Math.PI - Math.PI / 4 + p; } else if (player.currentForm === 1) { const p = progress * Math.PI * 1.5; swordAngle = player.facing === "right" ? -Math.PI*0.7 + p : Math.PI + Math.PI*0.7 - p; } else if (player.currentForm === 2) { swordAngle = player.facing === "right" ? progress * Math.PI * 2 : -progress * Math.PI * 2; } else if (player.currentForm === 3) { swordAngle = player.facing === "right" ? progress * Math.PI * 8 : -progress * Math.PI * 8; } else if (player.currentForm === 4) { swordAngle = (player.facing === "right" ? 0 : Math.PI) + Math.sin(player.attackFrame * 0.15) * 1.2; } } else if (keys.G) { swordAngle = player.facing === "right" ? 1.15 : Math.PI - 1.15; handY = 8; }
-    const tipX = handX + Math.cos(swordAngle) * swordLength; const tipY = handY + Math.sin(swordAngle) * swordLength; ctx.fillStyle = "#d97706"; ctx.beginPath(); ctx.arc(handX, handY, 5, 0, Math.PI * 2); ctx.fill(); ctx.strokeStyle = "#09090b"; ctx.lineWidth = 3.5; ctx.beginPath(); ctx.moveTo(handX, handY); ctx.lineTo(tipX, tipY); ctx.stroke(); ctx.strokeStyle = "#38bdf8"; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(handX + Math.cos(swordAngle) * 4, handY + Math.sin(swordAngle) * 4); ctx.lineTo(tipX, tipY); ctx.stroke();
+    else if (player.isAttacking) { const progress = player.attackFrame / player.maxAttackFrames; if (player.currentForm === 0) { const p = progress * Math.PI; if (player.m1Step === 1) swordAngle = player.facing === "right" ? -Math.PI / 3 + p : Math.PI + Math.PI / 3 - p; else if (player.m1Step === 2) swordAngle = player.facing === "right" ? -Math.PI / 2 + p * 1.2 : Math.PI + Math.PI / 2 - p * 1.2; else if (player.m1Step === 3) swordAngle = player.facing === "right" ? -Math.PI / 1.5 + p : Math.PI + Math.PI / 1.5 - p; else if (player.m1Step === 4) swordAngle = player.facing === "right" ? Math.PI / 4 - p : Math.PI - Math.PI / 4 + p; } else if (player.currentForm === 1) { const p = progress * Math.PI * 1.5; swordAngle = player.facing === "right" ? -Math.PI*0.7 + p : Math.PI + Math.PI*0.7 - p; } else if (player.currentForm === 2) { swordAngle = player.facing === "right" ? progress * Math.PI * 2 : -progress * Math.PI * 2; } else if (player.currentForm === 3) { swordAngle = player.facing === "right" ? progress * Math.PI * 8 : -progress * Math.PI * 8; } else if (player.currentForm === 4) { swordAngle = (player.facing === "right" ? 0 : Math.PI) + Math.sin(player.attackFrame * 0.15) * 1.2; } else if (player.currentForm === 5) { const p = progress * Math.PI * 2.2; swordAngle = player.facing === "right" ? -Math.PI * 0.85 + p : Math.PI + Math.PI * 0.85 - p; handY = -2 + Math.sin(progress * Math.PI) * 8; } } else if (keys.G) { swordAngle = player.facing === "right" ? 1.15 : Math.PI - 1.15; handY = 8; }
+    const tipX = handX + Math.cos(swordAngle) * swordLength; const tipY = handY + Math.sin(swordAngle) * swordLength; ctx.fillStyle = "#d97706"; ctx.beginPath(); ctx.arc(handX, handY, 5, 0, Math.PI * 2); ctx.fill(); ctx.strokeStyle = "#09090b"; ctx.lineWidth = 3.5; ctx.beginPath(); ctx.moveTo(handX, handY); ctx.lineTo(tipX, tipY); ctx.stroke(); ctx.strokeStyle = player.currentForm >= 5 ? "#f97316" : "#38bdf8"; ctx.lineWidth = player.currentForm >= 5 ? 2 : 1; ctx.beginPath(); ctx.moveTo(handX + Math.cos(swordAngle) * 4, handY + Math.sin(swordAngle) * 4); ctx.lineTo(tipX, tipY); ctx.stroke();
 }
-function drawProjectiles() { projectiles.forEach((pr) => { ctx.save(); ctx.shadowBlur = 18; ctx.shadowColor = pr.color; ctx.fillStyle = pr.color; ctx.beginPath(); ctx.arc(pr.x - cameraX, pr.y, pr.radius, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = "#ffffff"; ctx.globalAlpha = 0.65; ctx.beginPath(); ctx.arc(pr.x - cameraX, pr.y, pr.coreRadius || 5, 0, Math.PI * 2); ctx.fill(); ctx.restore(); }); }
+function drawProjectiles() {
+    projectiles.forEach((pr) => {
+        const sx = pr.x - cameraX;
+        const sy = pr.y;
+        const angle = Math.atan2(pr.vy || 0, pr.vx || 1);
+        const len = Math.max(46, (pr.radius || 14) * 4.6);
+        const h = Math.max(14, (pr.radius || 14) * 1.45);
+        const color = pr.deflected ? "#fb923c" : (pr.color || "#38bdf8");
+
+        ctx.save();
+        ctx.translate(sx, sy);
+        ctx.rotate(angle);
+        ctx.globalAlpha = pr.alpha ?? 1;
+        ctx.shadowBlur = 22;
+        ctx.shadowColor = color;
+
+        // Manga-style compressed shockwave / blue-metal-afterglow projectile.
+        ctx.fillStyle = color;
+        ctx.strokeStyle = "#e0f2fe";
+        ctx.lineWidth = 2;
+
+        ctx.beginPath();
+        ctx.moveTo(len * 0.52, 0);
+        ctx.quadraticCurveTo(len * 0.22, -h * 0.82, -len * 0.28, -h * 0.58);
+        ctx.lineTo(-len * 0.52, -h * 0.22);
+        ctx.lineTo(-len * 0.32, -h * 0.05);
+        ctx.lineTo(-len * 0.58, h * 0.12);
+        ctx.lineTo(-len * 0.22, h * 0.34);
+        ctx.quadraticCurveTo(len * 0.18, h * 0.78, len * 0.52, 0);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.globalAlpha *= 0.75;
+        ctx.fillStyle = "#ffffff";
+        ctx.beginPath();
+        ctx.moveTo(len * 0.35, 0);
+        ctx.quadraticCurveTo(len * 0.06, -h * 0.35, -len * 0.24, -h * 0.18);
+        ctx.quadraticCurveTo(len * 0.02, h * 0.22, len * 0.35, 0);
+        ctx.fill();
+
+        ctx.globalAlpha *= 0.55;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 3;
+        for (let i = 0; i < 3; i++) {
+            const tailY = (i - 1) * h * 0.34;
+            ctx.beginPath();
+            ctx.moveTo(-len * (0.38 + i * 0.07), tailY);
+            ctx.lineTo(-len * (0.78 + i * 0.05), tailY + (Math.random() - 0.5) * 7);
+            ctx.stroke();
+        }
+
+        ctx.restore();
+    });
+}
+
 
 function drawEnemies() {
     demons.forEach((d) => {
@@ -2404,7 +3787,27 @@ function drawEnemies() {
 }
 
 function drawEnemyHealthBar(d) { ctx.fillStyle = "#0f172a"; ctx.fillRect(d.x - cameraX, d.y - 16, d.width, 8); const pct = clamp(d.health / d.maxHealth, 0, 1); if (d.type === "brute") ctx.fillStyle = "#fb923c"; else if (d.type === "swift") ctx.fillStyle = "#f43f5e"; else if (d.type === "sniper") ctx.fillStyle = "#c084fc"; else ctx.fillStyle = "#ef4444"; ctx.fillRect(d.x - cameraX, d.y - 16, pct * d.width, 8); ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 1; ctx.strokeRect(d.x - cameraX, d.y - 16, d.width, 8); }
-function drawHealTexts() { healTexts.forEach((h) => { ctx.save(); ctx.globalAlpha = h.alpha; ctx.fillStyle = "#22c55e"; ctx.font = `bold 22px ${PIXEL_FONT}`; const text = typeof h.amount === "number" ? `+${h.amount} HP` : `${h.amount}`; ctx.fillText(text, h.x - cameraX - 30, h.y); ctx.restore(); }); }
+function drawHealTexts() {
+    healTexts.forEach((h) => {
+        ctx.save();
+        ctx.globalAlpha = h.alpha;
+        const text = typeof h.amount === "number" ? `+${h.amount} HP` : `${h.amount}`;
+        const isStun = text.includes("STUNNED");
+        const isSun = text.includes("SUN");
+        const fontSize = isStun ? 26 : isSun ? 24 : 22;
+        const pulse = 1 + Math.sin((h.maxLife || 70) - h.life) * 0.04;
+        ctx.translate(h.x - cameraX, h.y);
+        ctx.scale(pulse, pulse);
+        ctx.font = `bold ${fontSize}px ${PIXEL_FONT}`;
+        ctx.lineWidth = isStun ? 5 : 4;
+        ctx.strokeStyle = "#020617";
+        ctx.fillStyle = h.color || "#22c55e";
+        const textW = ctx.measureText(text).width;
+        ctx.strokeText(text, -textW / 2, 0);
+        ctx.fillText(text, -textW / 2, 0);
+        ctx.restore();
+    });
+}
 
 // =====================================================
 // CLEAN HUD
@@ -2468,8 +3871,24 @@ function drawTopBars() {
     ctx.fillStyle = "rgba(0,0,0,0.45)";
     ctx.fillRect(x, breathY, barW, barH);
     const breathPct = clamp(player.breathing / player.maxBreathing, 0, 1);
+    const waterLimitPct = 150 / player.maxBreathing;
+    const waterFillPct = Math.min(breathPct, waterLimitPct);
+    const sunFillPct = Math.max(0, breathPct - waterLimitPct);
     ctx.fillStyle = "#06b6d4";
-    ctx.fillRect(x, breathY, barW * breathPct, barH);
+    ctx.fillRect(x, breathY, barW * waterFillPct, barH);
+    if (sunFillPct > 0) {
+        const gradient = ctx.createLinearGradient(x + barW * waterLimitPct, breathY, x + barW, breathY);
+        gradient.addColorStop(0, "#f97316");
+        gradient.addColorStop(1, "#ef4444");
+        ctx.fillStyle = gradient;
+        ctx.fillRect(x + barW * waterLimitPct, breathY, barW * sunFillPct, barH);
+    }
+    ctx.strokeStyle = "#fbbf24";
+    ctx.lineWidth = Math.max(1, 2 * s);
+    ctx.beginPath();
+    ctx.moveTo(x + barW * waterLimitPct, breathY - 3 * s);
+    ctx.lineTo(x + barW * waterLimitPct, breathY + barH + 3 * s);
+    ctx.stroke();
     ctx.strokeStyle = "#ffffff";
     ctx.lineWidth = Math.max(2, 3 * s);
     ctx.strokeRect(x, breathY, barW, barH);
@@ -2486,20 +3905,21 @@ function drawTopBars() {
 
 function drawFormsMinimal() {
     const s = getHudScale();
-    const panelW = 500 * s;
+    const panelW = 560 * s;
     const x = Math.max(12 * s, canvas.width - panelW);
     const y = 145 * s;
     const titleFont = Math.max(12, 20 * s);
-    const rowFont = Math.max(10, 16 * s);
+    const rowFont = Math.max(9, 15 * s);
     const dashFont = Math.max(10, 18 * s);
-    const rowGap = 24 * s;
-    const rightOffset = 430 * s;
+    const rowGap = 23 * s;
+    const rightOffset = 470 * s;
     const formsInfo = [
-        { id: 1, key: "1", name: "1ST FORM: WATER SLASH", req: 40 },
-        { id: 2, key: "2", name: "2ND FORM: WATER WHEEL", req: 80 },
-        { id: 3, key: "3", name: "3RD FORM: WHIRLPOOL", req: 100 },
-        { id: 4, key: "4", name: "4TH FORM: FLOW DANCE", req: 140 },
-        { id: 5, key: "5", name: "5TH ABILITY: TOTAL CONCENTRATION", req: 0 }
+        { id: 1, key: "1", name: "1ST FORM: WATER SLASH", req: 40, sun: false },
+        { id: 2, key: "2", name: "2ND FORM: WATER WHEEL", req: 80, sun: false },
+        { id: 3, key: "3", name: "3RD FORM: WHIRLPOOL", req: 100, sun: false },
+        { id: 4, key: "4", name: "4TH FORM: FLOW DANCE", req: 140, sun: false },
+        { id: 5, key: "5", name: "SUN BREATHING 1ST FORM: SUN DANCE", req: 180, sun: true },
+        { id: "F", key: "F", name: "TOTAL CONCENTRATION", req: 0, sun: false }
     ];
 
     ctx.save();
@@ -2514,9 +3934,10 @@ function drawFormsMinimal() {
     for (let i = 0; i < formsInfo.length; i++) {
         const f = formsInfo[i];
         const rowY = y + i * rowGap;
-        let color = "#ffffff";
+        let color = f.sun ? "#fb923c" : "#ffffff";
         let rightText = "READY";
-        if (f.id === 5) {
+
+        if (f.id === "F") {
             if (player.totalConcentrationActive) { color = "#38bdf8"; rightText = `${Math.ceil(player.totalConcentrationTimer / 60)}s`; }
             else if (player.totalConcentrationCooldown > 0) { color = "#f87171"; rightText = `${Math.ceil(player.totalConcentrationCooldown / 60)}s`; }
             else { color = "#22c55e"; rightText = "READY"; }
@@ -2524,11 +3945,12 @@ function drawFormsMinimal() {
             const isLocked = player.breathing < f.req;
             const isSelected = player.selectedForm === f.id;
             const cd = formCooldowns[f.id];
-            if (isSelected) color = "#fbbf24";
+            if (isSelected) color = f.sun ? "#fbbf24" : "#fbbf24";
             if (isLocked) { color = "#64748b"; rightText = `REQ ${f.req}`; }
             else if (cd > 0) { color = "#f87171"; rightText = `${Math.ceil(cd / 60)}s`; }
             else { rightText = "READY"; }
         }
+
         ctx.strokeStyle = "#000000";
         ctx.lineWidth = Math.max(2, 4 * s);
         ctx.strokeText(`${f.key}. ${f.name}`, x, rowY);
@@ -2541,26 +3963,27 @@ function drawFormsMinimal() {
         ctx.fillText(rightText, x + rightOffset, rowY);
     }
 
+    const baseY = y + formsInfo.length * rowGap + 2 * s;
     ctx.strokeStyle = "#000000";
     ctx.lineWidth = Math.max(2, 4 * s);
     ctx.font = `bold ${dashFont}px ${PIXEL_FONT}`;
-    ctx.strokeText(`DASHES: ${player.dashCharges}/${player.maxDashCharges}`, x, y + 118 * s);
+    ctx.strokeText(`DASHES: ${player.dashCharges}/${player.maxDashCharges}`, x, baseY);
     ctx.fillStyle = "#38bdf8";
-    ctx.fillText(`DASHES: ${player.dashCharges}/${player.maxDashCharges}`, x, y + 118 * s);
+    ctx.fillText(`DASHES: ${player.dashCharges}/${player.maxDashCharges}`, x, baseY);
     if (player.dashCharges < player.maxDashCharges) {
-        ctx.strokeText(`RECHARGE: ${(player.dashRechargeTimer / 60).toFixed(1)}s`, x, y + 142 * s);
+        ctx.strokeText(`RECHARGE: ${(player.dashRechargeTimer / 60).toFixed(1)}s`, x, baseY + 24 * s);
         ctx.fillStyle = "#cbd5e1";
-        ctx.fillText(`RECHARGE: ${(player.dashRechargeTimer / 60).toFixed(1)}s`, x, y + 142 * s);
+        ctx.fillText(`RECHARGE: ${(player.dashRechargeTimer / 60).toFixed(1)}s`, x, baseY + 24 * s);
     }
     if (player.totalConcentrationActive) {
-        ctx.strokeText("TOTAL CONCENTRATION ACTIVE", x, y + 190 * s);
+        ctx.strokeText("TOTAL CONCENTRATION ACTIVE", x, baseY + 72 * s);
         ctx.fillStyle = "#38bdf8";
-        ctx.fillText("TOTAL CONCENTRATION ACTIVE", x, y + 190 * s);
+        ctx.fillText("TOTAL CONCENTRATION ACTIVE", x, baseY + 72 * s);
     }
     if (player.isGuarding) {
-        ctx.strokeText("GUARDING", x, y + 214 * s);
+        ctx.strokeText("GUARDING", x, baseY + 96 * s);
         ctx.fillStyle = "#fbbf24";
-        ctx.fillText("GUARDING", x, y + 214 * s);
+        ctx.fillText("GUARDING", x, baseY + 96 * s);
     }
     ctx.restore();
 }
@@ -2700,18 +4123,48 @@ function wrapPixelText(text, x, y, maxWidth, lineHeight) {
 // MAIN LOOP
 // =====================================================
 let lastTime = performance.now();
-let globalDt = 1; 
+let globalDt = 1;
+let lastLoopErrorLogTime = 0;
+
+function drawEmergencyRecoveryFrame(error) {
+    try {
+        resetCanvasContextState();
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        if (gameState === "playing") {
+            ctx.fillStyle = "#09030a";
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.fillStyle = "#050505";
+            ctx.fillRect(0, GROUND_Y, canvas.width, canvas.height - GROUND_Y);
+            ctx.fillStyle = "#38bdf8";
+            ctx.fillRect(player.x - cameraX, player.y, player.width, player.height);
+            ctx.fillStyle = "#e0f2fe";
+            ctx.font = `bold 14px ${PIXEL_FONT}`;
+            ctx.fillText("RECOVERING FRAME...", 24, 42);
+        }
+    } catch (_) {}
+}
 
 function gameLoop(currentTime) {
-    if (!currentTime) currentTime = performance.now();
-    globalDt = (currentTime - lastTime) / 8.5; 
-    lastTime = currentTime;
-    
-    if (globalDt > 3) globalDt = 3; 
-    if (globalDt < 0) globalDt = 0;
+    try {
+        if (!currentTime) currentTime = performance.now();
+        globalDt = (currentTime - lastTime) / 8.5;
+        lastTime = currentTime;
 
-    update();
-    draw();
-    requestAnimationFrame(gameLoop);
+        if (globalDt > 3) globalDt = 3;
+        if (globalDt < 0) globalDt = 0;
+
+        update();
+        draw();
+    } catch (error) {
+        const now = performance.now();
+        if (now - lastLoopErrorLogTime > 1000) {
+            console.error("Game loop recovered from an error:", error);
+            lastLoopErrorLogTime = now;
+        }
+        drawEmergencyRecoveryFrame(error);
+    } finally {
+        requestAnimationFrame(gameLoop);
+    }
 }
 requestAnimationFrame((time) => { lastTime = time; gameLoop(time); });

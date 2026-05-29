@@ -937,3 +937,276 @@ input:focus {
     grid-template-columns: 1fr;
   }
 }
+
+/* ===== FINAL RESPONSIVE MENU FIX =====
+   Keeps the logo/title visible WITHOUT covering the buttons.
+   Main structure uses Flexbox; cards use Grid for responsive columns. */
+#mainMenu {
+  align-items: flex-start !important;
+  justify-content: center !important;
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+  padding: clamp(0.35rem, 1vw, 0.8rem) !important;
+}
+
+.menu-ui {
+  width: min(1160px, 95vw) !important;
+  min-height: auto !important;
+  max-height: none !important;
+  display: flex !important;
+  flex-direction: column !important;
+  justify-content: flex-start !important;
+  align-items: stretch !important;
+  gap: clamp(0.42rem, 1.1vh, 0.8rem) !important;
+  padding: clamp(0.35rem, 1vw, 0.75rem) clamp(0.45rem, 1.2vw, 0.95rem) 1rem !important;
+}
+
+.mode-header {
+  position: relative !important;
+  top: auto !important;
+  z-index: 6 !important;
+  width: min(780px, 88vw) !important;
+  margin: 0 auto clamp(0.1rem, 0.5vh, 0.35rem) !important;
+  padding: clamp(0.22rem, 0.8vw, 0.48rem) clamp(0.7rem, 1.6vw, 1.1rem) !important;
+  border: 0.1rem solid rgba(226, 232, 240, 0.22) !important;
+  background: linear-gradient(180deg, rgba(2, 6, 23, 0.82), rgba(2, 6, 23, 0.48)) !important;
+  box-shadow: 0 0.55rem 1.5rem rgba(0,0,0,0.24), 0 0 1.2rem rgba(56,189,248,0.18) !important;
+  backdrop-filter: blur(0.45rem) !important;
+  text-align: center !important;
+}
+
+.menu-title {
+  font-size: clamp(1.45rem, 3.55vw, 2.75rem) !important;
+  line-height: 1 !important;
+  letter-spacing: clamp(0.03em, 0.45vw, 0.08em) !important;
+  white-space: nowrap !important;
+  color: #f8fbff !important;
+  text-shadow:
+    0 0 0.14rem rgba(255,255,255,0.95),
+    0 0 0.65rem rgba(56,189,248,0.95),
+    0 0 1.25rem rgba(56,189,248,0.45),
+    0.13rem 0.13rem 0 rgba(14, 116, 144, 0.95) !important;
+}
+
+.selection-container {
+  width: min(100%, 1080px) !important;
+  margin: 0 auto !important;
+  display: grid !important;
+  grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
+  gap: clamp(0.45rem, 1.2vw, 0.85rem) !important;
+  min-height: auto !important;
+}
+
+.mode-btn {
+  min-height: clamp(4.65rem, 11.4vh, 7.2rem) !important;
+  padding: clamp(0.45rem, 1.15vw, 0.9rem) clamp(0.55rem, 1.25vw, 1rem) !important;
+  gap: clamp(0.22rem, 0.65vh, 0.42rem) !important;
+  border-width: 0.11rem !important;
+  box-shadow: 0 0.8rem 2rem rgba(0,0,0,0.2) !important;
+}
+
+.mode-btn::after {
+  inset: 0.32rem !important;
+}
+
+.mode-name {
+  font-size: clamp(1.05rem, 2.65vw, 2.05rem) !important;
+  line-height: 1 !important;
+}
+
+.controls-btn .mode-name {
+  font-size: clamp(0.78rem, 1.78vw, 1.24rem) !important;
+  line-height: 1.18 !important;
+}
+
+.mode-kicker {
+  font-size: clamp(0.38rem, 0.72vw, 0.52rem) !important;
+  line-height: 1.35 !important;
+}
+
+.mode-desc {
+  font-size: clamp(0.38rem, 0.72vw, 0.54rem) !important;
+  line-height: 1.45 !important;
+}
+
+.player-score-summary,
+.leaderboard-grid,
+#authPanel {
+  width: min(100%, 1050px) !important;
+  margin-left: auto !important;
+  margin-right: auto !important;
+}
+
+.player-score-summary {
+  grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  gap: clamp(0.5rem, 1.2vw, 0.85rem) !important;
+}
+
+.player-score-card {
+  min-height: auto !important;
+  padding: clamp(0.55rem, 1vw, 0.78rem) clamp(0.65rem, 1.15vw, 0.95rem) !important;
+  gap: 0.28rem !important;
+}
+
+.score-summary-label {
+  font-size: clamp(0.38rem, 0.72vw, 0.52rem) !important;
+  line-height: 1.38 !important;
+}
+
+.player-score-card b {
+  font-size: clamp(0.78rem, 1.45vw, 1.1rem) !important;
+  line-height: 1.05 !important;
+}
+
+/* override the runtime auth CSS injected by game.js */
+#authPanel {
+  margin-top: clamp(0.1rem, 0.65vh, 0.45rem) !important;
+  padding: clamp(0.55rem, 1vw, 0.8rem) !important;
+  border-width: 0.11rem !important;
+  background: linear-gradient(180deg, rgba(15,23,42,0.88), rgba(2,6,23,0.76)) !important;
+}
+
+#authPanel .auth-title-row {
+  margin-bottom: 0.5rem !important;
+  gap: 0.65rem !important;
+}
+
+#authPanel h2 {
+  font-size: clamp(0.55rem, 1.05vw, 0.82rem) !important;
+  line-height: 1.25 !important;
+}
+
+#authStatus {
+  font-size: clamp(0.42rem, 0.76vw, 0.55rem) !important;
+  line-height: 1.45 !important;
+  text-align: right !important;
+}
+
+#authForm {
+  display: grid !important;
+  grid-template-columns: minmax(8rem, 1fr) minmax(10rem, 1.25fr) minmax(10rem, 1.25fr) minmax(7rem, 0.75fr) minmax(7rem, 0.75fr) !important;
+  gap: 0.5rem !important;
+}
+
+#authForm input,
+#authForm button {
+  min-height: 2.45rem !important;
+  padding: 0.55rem 0.6rem !important;
+  font-size: clamp(0.42rem, 0.78vw, 0.55rem) !important;
+}
+
+.leaderboard-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  gap: clamp(0.5rem, 1.2vw, 0.9rem) !important;
+}
+
+.leaderboard-card {
+  min-height: clamp(9.2rem, 21vh, 12.2rem) !important;
+  padding: clamp(0.65rem, 1vw, 0.9rem) !important;
+}
+
+.leaderboard-heading {
+  padding-bottom: 0.5rem !important;
+  gap: 0.55rem !important;
+}
+
+.leaderboard-heading h2 {
+  font-size: clamp(0.55rem, 1.05vw, 0.78rem) !important;
+  line-height: 1.35 !important;
+}
+
+.leaderboard-heading span {
+  font-size: clamp(0.36rem, 0.62vw, 0.45rem) !important;
+}
+
+.score-list {
+  gap: 0.28rem !important;
+  padding-top: 0.55rem !important;
+}
+
+.score-list li {
+  grid-template-columns: 1.7rem minmax(0, 1fr) auto !important;
+  gap: 0.55rem !important;
+  font-size: clamp(0.45rem, 0.82vw, 0.6rem) !important;
+  line-height: 1.15 !important;
+}
+
+.sync-status {
+  font-size: clamp(0.38rem, 0.72vw, 0.52rem) !important;
+  line-height: 1.4 !important;
+  padding-bottom: 0.25rem !important;
+}
+
+@media (max-height: 720px) {
+  .menu-ui {
+    gap: 0.42rem !important;
+    padding-top: 0.25rem !important;
+  }
+
+  .mode-header {
+    width: min(680px, 84vw) !important;
+    padding: 0.18rem 0.7rem !important;
+  }
+
+  .menu-title {
+    font-size: clamp(1.2rem, 3vw, 2.15rem) !important;
+  }
+
+  .mode-btn {
+    min-height: clamp(4.2rem, 10vh, 5.8rem) !important;
+    padding-top: 0.42rem !important;
+    padding-bottom: 0.42rem !important;
+  }
+
+  .leaderboard-card {
+    min-height: 8.7rem !important;
+  }
+
+  #authPanel {
+    padding: 0.5rem !important;
+  }
+}
+
+@media (max-width: 900px) {
+  .selection-container,
+  .player-score-summary,
+  .leaderboard-grid {
+    grid-template-columns: 1fr !important;
+  }
+
+  .mode-header {
+    width: min(100%, 720px) !important;
+  }
+
+  .menu-title {
+    white-space: normal !important;
+  }
+
+  #authPanel .auth-title-row {
+    align-items: flex-start !important;
+    flex-direction: column !important;
+  }
+
+  #authStatus {
+    text-align: left !important;
+  }
+
+  #authForm {
+    grid-template-columns: 1fr !important;
+  }
+}
+
+@media (max-width: 560px) {
+  #mainMenu {
+    padding: 0.35rem !important;
+  }
+
+  .mode-btn {
+    clip-path: none !important;
+  }
+
+  .leaderboard-heading {
+    align-items: flex-start !important;
+    flex-direction: column !important;
+  }
+}
